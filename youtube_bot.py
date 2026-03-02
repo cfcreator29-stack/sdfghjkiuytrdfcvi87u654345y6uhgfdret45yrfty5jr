@@ -13,7 +13,7 @@
 # ║                      ⚙️  НАСТРОЙКИ                             ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-BOT_TOKEN        = "8547217851:AAGhA3nV47OQL1aPj2zhGlVFYEhs_VWby44"
+BOT_TOKEN        = "8546106114:AAGpGGzszJlUIxwGbWQpzez7Vbcz883Wg14"
 ADMIN_IDS        = [8535260202]
 SUPPORT_USERNAME = "@famelonov"
 
