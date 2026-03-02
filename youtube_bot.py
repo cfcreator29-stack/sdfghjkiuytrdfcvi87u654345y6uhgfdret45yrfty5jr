@@ -336,8 +336,11 @@ async def download_thumbnail(url: str, out_dir: str) -> str | None:
             "outtmpl": os.path.join(out_dir, "thumb"),
             "quiet": True,
             "no_warnings": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
         }
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         def _dl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
@@ -358,14 +361,22 @@ async def download_thumbnail(url: str, out_dir: str) -> str | None:
 async def download_audio(url: str, out_dir: str) -> tuple[str | None, dict]:
     try:
         ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "format": "bestaudio/best",
             "outtmpl": os.path.join(out_dir, "audio.%(ext)s"),
-            "quiet": False,
-            "no_warnings": False,
+            "quiet": True,
+            "no_warnings": True,
             "ignoreerrors": False,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
         }
         info = {}
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _dl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -374,6 +385,7 @@ async def download_audio(url: str, out_dir: str) -> tuple[str | None, dict]:
                     info.update(data)
         await loop.run_in_executor(None, _dl)
 
+        # Ищем скачанный файл (mp3 после конвертации или любой аудио файл)
         for f in os.listdir(out_dir):
             full = os.path.join(out_dir, f)
             if os.path.isfile(full):
@@ -381,19 +393,49 @@ async def download_audio(url: str, out_dir: str) -> tuple[str | None, dict]:
         return None, info
     except Exception as e:
         logger.error(f"Ошибка скачивания аудио: {e}")
+        # Fallback без ffmpeg
+        try:
+            ydl_opts_fallback = {
+                "format": "worstaudio/worst",
+                "outtmpl": os.path.join(out_dir, "audio_fb.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                },
+            }
+            info2 = {}
+            loop2 = asyncio.get_running_loop()
+            def _dl2():
+                with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
+                    data = ydl.extract_info(url, download=True)
+                    if data:
+                        info2.update(data)
+            await loop2.run_in_executor(None, _dl2)
+            for f in os.listdir(out_dir):
+                full = os.path.join(out_dir, f)
+                if os.path.isfile(full):
+                    return full, info2
+        except Exception as e2:
+            logger.error(f"Fallback аудио тоже не удался: {e2}")
         return None, {}
 
 async def download_video(url: str, out_dir: str) -> tuple[str | None, dict]:
     try:
         ydl_opts = {
-            "format": "best[ext=mp4][height<=720]/best[ext=mp4]/best",
+            # Приоритет: mp4 с объединением через ffmpeg → просто лучший mp4 → любой
+            "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/bestvideo[ext=mp4][height<=720]+bestaudio/best[ext=mp4][height<=720]/best[ext=mp4]/best",
             "outtmpl": os.path.join(out_dir, "video.%(ext)s"),
-            "quiet": False,
-            "no_warnings": False,
+            "quiet": True,
+            "no_warnings": True,
             "ignoreerrors": False,
+            "merge_output_format": "mp4",
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
         }
         info = {}
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _dl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -409,12 +451,44 @@ async def download_video(url: str, out_dir: str) -> tuple[str | None, dict]:
         return None, info
     except Exception as e:
         logger.error(f"Ошибка скачивания видео: {e}")
+        # Fallback — без объединения потоков (не нужен ffmpeg)
+        try:
+            ydl_opts_fallback = {
+                "format": "best[ext=mp4]/best",
+                "outtmpl": os.path.join(out_dir, "video_fb.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                },
+            }
+            info2 = {}
+            loop2 = asyncio.get_running_loop()
+            def _dl2():
+                with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
+                    data = ydl.extract_info(url, download=True)
+                    if data:
+                        info2.update(data)
+            await loop2.run_in_executor(None, _dl2)
+            for f in os.listdir(out_dir):
+                full = os.path.join(out_dir, f)
+                if os.path.isfile(full):
+                    return full, info2
+        except Exception as e2:
+            logger.error(f"Fallback видео тоже не удался: {e2}")
         return None, {}
 
 async def get_video_info(url: str) -> dict | None:
     try:
-        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        loop = asyncio.get_event_loop()
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+        }
+        loop = asyncio.get_running_loop()
         result = {}
         def _info():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -422,7 +496,8 @@ async def get_video_info(url: str) -> dict | None:
                 result.update(data or {})
         await loop.run_in_executor(None, _info)
         return result if result else None
-    except Exception:
+    except Exception as e:
+        logger.error(f"Ошибка получения информации: {e}")
         return None
 
 
@@ -612,7 +687,8 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
             if not path:
                 return await status.edit_text(
                     "❌ Не удалось скачать аудио.\n"
-                    "Попробуйте другое видео или другой формат."
+                    "Убедитесь что установлен <b>ffmpeg</b>, или попробуйте другое видео.",
+                    parse_mode="HTML"
                 )
 
             size_mb = os.path.getsize(path) / (1024 * 1024)
@@ -624,15 +700,27 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
 
             await status.edit_text("📤 Отправляю аудио...")
             duration = info.get("duration", 0)
-            fname    = os.path.basename(path)
-            await bot.send_audio(
-                uid,
-                FSInputFile(path, filename=fname),
-                title=title,
-                duration=int(duration) if duration else None,
-                caption=f"🎵 <b>{title}</b>",
-                parse_mode="HTML"
-            )
+            # Формируем безопасное имя файла
+            safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:50]
+            ext = os.path.splitext(path)[1] or ".mp3"
+            fname = f"{safe_title}{ext}"
+            try:
+                await bot.send_audio(
+                    uid,
+                    FSInputFile(path, filename=fname),
+                    title=title,
+                    duration=int(duration) if duration else None,
+                    caption=f"🎵 <b>{title}</b>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                # Если send_audio не принял формат — шлём как документ
+                await bot.send_document(
+                    uid,
+                    FSInputFile(path, filename=fname),
+                    caption=f"🎵 <b>{title}</b>",
+                    parse_mode="HTML"
+                )
 
         elif dl_type == "dl_video":
             await status.edit_text("🎬 Скачиваю видео...")
@@ -640,7 +728,8 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
             if not path:
                 return await status.edit_text(
                     "❌ Не удалось скачать видео.\n"
-                    "Попробуйте другое видео или скачайте только звук."
+                    "Убедитесь что установлен <b>ffmpeg</b>, или попробуйте скачать только звук.",
+                    parse_mode="HTML"
                 )
 
             size_mb = os.path.getsize(path) / (1024 * 1024)
@@ -653,13 +742,25 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
 
             await status.edit_text("📤 Отправляю видео...")
             duration = info.get("duration", 0)
-            await bot.send_video(
-                uid,
-                FSInputFile(path),
-                duration=int(duration) if duration else None,
-                caption=f"🎬 <b>{title}</b>",
-                parse_mode="HTML"
-            )
+            safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:50]
+            ext = os.path.splitext(path)[1] or ".mp4"
+            fname = f"{safe_title}{ext}"
+            try:
+                await bot.send_video(
+                    uid,
+                    FSInputFile(path, filename=fname),
+                    duration=int(duration) if duration else None,
+                    caption=f"🎬 <b>{title}</b>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                # Если send_video не принял формат — шлём как документ
+                await bot.send_document(
+                    uid,
+                    FSInputFile(path, filename=fname),
+                    caption=f"🎬 <b>{title}</b>",
+                    parse_mode="HTML"
+                )
 
         await status.delete()
         inc_downloads(uid)
