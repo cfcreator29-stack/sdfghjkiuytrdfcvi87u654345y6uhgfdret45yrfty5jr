@@ -24,13 +24,16 @@ REF_VIP_DAYS     = 7
 
 MAX_FILE_SIZE_MB = 100
 
-# ═══════════════════════════════════════════════════════════════════
+# Текст рекламы бота, который добавляется к подписи файла (только не-ВИП)
+BOT_AD_TEXT = "\n\n🤖 <b>Скачано через @FVyoutube_bot</b>\n📥 Скачивай видео, аудио и превью с YouTube бесплатно!"
 
+# ═══════════════════════════════════════════════════════════════════
 
 import asyncio
 import logging
 import sqlite3
 import os
+import random
 import tempfile
 import shutil
 from datetime import datetime, timedelta
@@ -121,6 +124,16 @@ def init_db():
                 stars       INTEGER,
                 payload     TEXT,
                 created_at  TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS ad_posts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                type            TEXT    NOT NULL DEFAULT 'text',
+                file_id         TEXT    DEFAULT NULL,
+                caption         TEXT    DEFAULT '',
+                buttons         TEXT    DEFAULT NULL,
+                auto_delete_sec INTEGER DEFAULT 0,
+                created_at      TEXT    DEFAULT ''
             );
         """)
 
@@ -244,6 +257,97 @@ async def check_subscriptions(uid: int):
     return missing
 
 
+# ── рекламные посты ───────────────────────────────────────────────
+
+def get_ad_posts():
+    with get_db() as c:
+        return c.execute("SELECT * FROM ad_posts ORDER BY id").fetchall()
+
+def get_ad_post(post_id: int):
+    with get_db() as c:
+        return c.execute("SELECT * FROM ad_posts WHERE id=?", (post_id,)).fetchone()
+
+def add_ad_post(post_type: str, file_id, caption: str, buttons, auto_delete_sec: int):
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO ad_posts (type,file_id,caption,buttons,auto_delete_sec,created_at) VALUES (?,?,?,?,?,?)",
+            (post_type, file_id, caption, buttons, auto_delete_sec,
+             datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+
+def update_ad_post(post_id: int, post_type: str, file_id, caption: str, buttons, auto_delete_sec: int):
+    with get_db() as c:
+        c.execute(
+            "UPDATE ad_posts SET type=?,file_id=?,caption=?,buttons=?,auto_delete_sec=? WHERE id=?",
+            (post_type, file_id, caption, buttons, auto_delete_sec, post_id)
+        )
+
+def delete_ad_post(post_id: int):
+    with get_db() as c:
+        c.execute("DELETE FROM ad_posts WHERE id=?", (post_id,))
+
+def get_random_ad_post():
+    posts = get_ad_posts()
+    if not posts:
+        return None
+    return random.choice(posts)
+
+
+async def send_ad_post(uid: int, post: tuple):
+    """
+    Отправляет рекламный пост пользователю.
+    post: (id, type, file_id, caption, buttons, auto_delete_sec, created_at)
+    """
+    _, post_type, file_id, caption, buttons_raw, auto_delete_sec, _ = post
+    kb = parse_buttons(buttons_raw)
+    try:
+        if post_type == "photo" and file_id:
+            sent = await bot.send_photo(uid, file_id, caption=caption or None,
+                                        reply_markup=kb, parse_mode="HTML")
+        elif post_type == "video" and file_id:
+            sent = await bot.send_video(uid, file_id, caption=caption or None,
+                                        reply_markup=kb, parse_mode="HTML")
+        else:
+            sent = await bot.send_message(uid, caption, reply_markup=kb, parse_mode="HTML")
+
+        if auto_delete_sec and auto_delete_sec > 0:
+            asyncio.create_task(_auto_delete_later(uid, sent.message_id, auto_delete_sec))
+        return sent
+    except Exception as e:
+        logger.warning(f"Ad post send error to {uid}: {e}")
+        return None
+
+
+async def _auto_delete_later(chat_id: int, message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+# ── после скачки: рекламный пост + предложение ВИП ───────────────
+
+async def _post_download_ads(uid: int):
+    """Отправляет рекламный пост и предложение ВИП. Только не-ВИП."""
+    if is_vip(uid):
+        return
+
+    ad = get_random_ad_post()
+    if ad:
+        await send_ad_post(uid, ad)
+
+    await bot.send_message(
+        uid,
+        f"💡 <i>Хотите без рекламы и без обязательных подписок?\n"
+        f"Активируйте ВИП за {VIP_PRICE_STARS} ⭐ звёзд в месяц!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="👑 Купить ВИП", callback_data="buy_vip")
+        ]]),
+        parse_mode="HTML"
+    )
+
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                      📐  FSM                                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -253,15 +357,19 @@ class Download(StatesGroup):
     waiting_type   = State()
 
 class AdminState(StatesGroup):
-    bc_content      = State()
-    bc_buttons      = State()
-    bc_confirm      = State()
-    give_vip_uid    = State()
-    give_vip_days   = State()
-    add_channel     = State()
-    ban_uid         = State()
-    set_vip_price   = State()
-    revoke_vip_uid  = State()
+    bc_content          = State()
+    bc_buttons          = State()
+    bc_confirm          = State()
+    give_vip_uid        = State()
+    give_vip_days       = State()
+    add_channel         = State()
+    ban_uid             = State()
+    set_vip_price       = State()
+    revoke_vip_uid      = State()
+    # рекламные посты
+    adpost_content      = State()
+    adpost_buttons      = State()
+    adpost_delete       = State()
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -277,18 +385,12 @@ def main_kb(uid):
         rows.append([KeyboardButton(text="⚙️ Админ панель")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
-def cancel_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True
-    )
-
 def download_type_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🎬 Видео",    callback_data="dl_video"),
-            InlineKeyboardButton(text="🖼 Превью",   callback_data="dl_thumb"),
-            InlineKeyboardButton(text="🎵 Звук",     callback_data="dl_audio"),
+            InlineKeyboardButton(text="🎬 Видео",  callback_data="dl_video"),
+            InlineKeyboardButton(text="🖼 Превью", callback_data="dl_thumb"),
+            InlineKeyboardButton(text="🎵 Звук",   callback_data="dl_audio"),
         ],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="dl_cancel")]
     ])
@@ -298,25 +400,50 @@ def sub_kb(channels):
     btns.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-def vip_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
+def vip_kb(uid=None):
+    rows = []
+    if uid and is_vip(uid):
+        rows.append([InlineKeyboardButton(
+            text="✅ ВИП уже активен",
+            callback_data="vip_already_active"
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
             text=f"⭐ Купить ВИП — {VIP_PRICE_STARS} звёзд/мес",
             callback_data="buy_vip"
-        )],
-        [InlineKeyboardButton(text="🎁 Реферальная программа", callback_data="ref_program")],
-    ])
+        )])
+    rows.append([InlineKeyboardButton(text="🎁 Реферальная программа", callback_data="ref_program")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика",         callback_data="adm_stats")],
-        [InlineKeyboardButton(text="👑 Выдать ВИП",         callback_data="adm_give_vip"),
-         InlineKeyboardButton(text="❌ Отобрать ВИП",       callback_data="adm_revoke_vip")],
-        [InlineKeyboardButton(text="📢 Рассылка",           callback_data="adm_broadcast")],
-        [InlineKeyboardButton(text="📺 Обяз. подписки",     callback_data="adm_channels")],
-        [InlineKeyboardButton(text="🚫 Бан/Разбан",         callback_data="adm_ban")],
-        [InlineKeyboardButton(text="💰 Изменить цену ВИП",  callback_data="adm_vip_price")],
+        [InlineKeyboardButton(text="📊 Статистика",        callback_data="adm_stats")],
+        [InlineKeyboardButton(text="👑 Выдать ВИП",        callback_data="adm_give_vip"),
+         InlineKeyboardButton(text="❌ Отобрать ВИП",      callback_data="adm_revoke_vip")],
+        [InlineKeyboardButton(text="📢 Рассылка",          callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="📺 Обяз. подписки",    callback_data="adm_channels")],
+        [InlineKeyboardButton(text="🚫 Бан/Разбан",        callback_data="adm_ban")],
+        [InlineKeyboardButton(text="💰 Изменить цену ВИП", callback_data="adm_vip_price")],
+        [InlineKeyboardButton(text="📣 Рекламные посты",   callback_data="adm_adposts")],
     ])
+
+def adm_back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")
+    ]])
+
+def _adpost_list_kb(posts):
+    rows = [[InlineKeyboardButton(text="➕ Добавить пост", callback_data="adp_add")]]
+    for p in posts:
+        preview = (p[3] or "")[:28].replace("\n", " ")
+        del_ico = f"🗑{p[5]}с" if p[5] else "♾"
+        label   = f"#{p[0]} [{p[1]}] {preview}"
+        rows.append([
+            InlineKeyboardButton(text=f"✏️ {label}", callback_data=f"adp_edit_{p[0]}"),
+            InlineKeyboardButton(text=del_ico,         callback_data=f"adp_del_{p[0]}"),
+        ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -324,17 +451,14 @@ def admin_kb():
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def _build_progress_bar(percent: float, width: int = 10) -> str:
-    """Строит текстовый прогресс-бар: ██████░░░░ 60%"""
     filled = int(width * percent / 100)
     bar    = "█" * filled + "░" * (width - filled)
     return f"[{bar}] {percent:.0f}%"
 
 
 class ProgressTracker:
-    """Хранит текущий прогресс загрузки yt-dlp и метку этапа."""
     def __init__(self):
         self.percent: float = 0.0
-        self.stage:   str   = ""
         self.speed:   str   = ""
         self.eta:     str   = ""
 
@@ -359,10 +483,6 @@ async def _animate_progress(
     stop_event: asyncio.Event,
     label: str,
 ):
-    """
-    Крутит анимацию пока stop_event не установлен.
-    Каждую секунду обновляет сообщение с актуальным прогрессом.
-    """
     FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     i = 0
     last_text = ""
@@ -391,7 +511,6 @@ async def _animate_progress(
 
 
 async def _safe_delete(msg: Message):
-    """Тихо удаляет сообщение."""
     try:
         await msg.delete()
     except Exception:
@@ -409,18 +528,12 @@ def is_youtube_url(url: str) -> bool:
 async def download_thumbnail(url: str, out_dir: str) -> str | None:
     try:
         ydl_opts = {
-            "skip_download": True,
-            "writethumbnail": True,
+            "skip_download": True, "writethumbnail": True,
             "outtmpl": os.path.join(out_dir, "thumb"),
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": True, "no_warnings": True,
         }
         loop = asyncio.get_event_loop()
-        def _dl():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-        await loop.run_in_executor(None, _dl)
-
+        await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
         for ext in ["jpg", "jpeg", "png", "webp"]:
             path = os.path.join(out_dir, f"thumb.{ext}")
             if os.path.exists(path):
@@ -434,28 +547,20 @@ async def download_thumbnail(url: str, out_dir: str) -> str | None:
         return None
 
 
-async def download_audio(
-    url: str, out_dir: str, tracker: ProgressTracker
-) -> tuple[str | None, dict]:
+async def download_audio(url: str, out_dir: str, tracker: ProgressTracker) -> tuple[str | None, dict]:
     try:
+        info = {}
         ydl_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": os.path.join(out_dir, "audio.%(ext)s"),
-            "quiet": False,
-            "no_warnings": False,
-            "ignoreerrors": False,
+            "quiet": False, "no_warnings": False, "ignoreerrors": False,
             "progress_hooks": [tracker.hook],
         }
-        info = {}
-        loop = asyncio.get_event_loop()
-
         def _dl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 data = ydl.extract_info(url, download=True)
-                if data:
-                    info.update(data)
-        await loop.run_in_executor(None, _dl)
-
+                if data: info.update(data)
+        await asyncio.get_event_loop().run_in_executor(None, _dl)
         for f in os.listdir(out_dir):
             full = os.path.join(out_dir, f)
             if os.path.isfile(full):
@@ -466,28 +571,20 @@ async def download_audio(
         return None, {}
 
 
-async def download_video(
-    url: str, out_dir: str, tracker: ProgressTracker
-) -> tuple[str | None, dict]:
+async def download_video(url: str, out_dir: str, tracker: ProgressTracker) -> tuple[str | None, dict]:
     try:
+        info = {}
         ydl_opts = {
             "format": "best[ext=mp4][height<=1080]/best[ext=mp4]/best",
             "outtmpl": os.path.join(out_dir, "video.%(ext)s"),
-            "quiet": False,
-            "no_warnings": False,
-            "ignoreerrors": False,
+            "quiet": False, "no_warnings": False, "ignoreerrors": False,
             "progress_hooks": [tracker.hook],
         }
-        info = {}
-        loop = asyncio.get_event_loop()
-
         def _dl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 data = ydl.extract_info(url, download=True)
-                if data:
-                    info.update(data)
-        await loop.run_in_executor(None, _dl)
-
+                if data: info.update(data)
+        await asyncio.get_event_loop().run_in_executor(None, _dl)
         for f in os.listdir(out_dir):
             full = os.path.join(out_dir, f)
             if os.path.isfile(full):
@@ -500,14 +597,13 @@ async def download_video(
 
 async def get_video_info(url: str) -> dict | None:
     try:
-        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        loop = asyncio.get_event_loop()
         result = {}
+        ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
         def _info():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 data = ydl.extract_info(url, download=False)
                 result.update(data or {})
-        await loop.run_in_executor(None, _info)
+        await asyncio.get_event_loop().run_in_executor(None, _info)
         return result if result else None
     except Exception:
         return None
@@ -595,22 +691,16 @@ async def download_start(msg: Message, state: FSMContext):
     if not await require_subscription(msg, msg.from_user.id):
         return
     await state.set_state(Download.waiting_url)
-    await msg.answer(
-        "🔗 Отправьте ссылку на YouTube видео:",
-        reply_markup=main_kb(msg.from_user.id)
-    )
+    await msg.answer("🔗 Отправьте ссылку на YouTube видео:", reply_markup=main_kb(msg.from_user.id))
 
 
 @router.message(Download.waiting_url)
 async def download_got_url(msg: Message, state: FSMContext):
     if msg.text in ("📥 Скачать", "👑 ВИП подписка", "🆘 Поддержка", "⚙️ Админ панель"):
         await state.clear()
-        if msg.text == "👑 ВИП подписка":
-            return await vip_menu(msg)
-        if msg.text == "🆘 Поддержка":
-            return await support(msg)
-        if msg.text == "⚙️ Админ панель":
-            return await admin_panel(msg, state)
+        if msg.text == "👑 ВИП подписка":   return await vip_menu(msg)
+        if msg.text == "🆘 Поддержка":       return await support(msg)
+        if msg.text == "⚙️ Админ панель":    return await admin_panel(msg, state)
         return await download_start(msg, state)
 
     url = msg.text.strip()
@@ -629,16 +719,14 @@ async def download_got_url(msg: Message, state: FSMContext):
     if not info:
         await _safe_delete(info_msg)
         return await msg.answer(
-            "❌ Не удалось получить информацию.\n"
-            "Проверьте ссылку или попробуйте позже.",
+            "❌ Не удалось получить информацию.\nПроверьте ссылку или попробуйте позже.",
             reply_markup=main_kb(msg.from_user.id)
         )
 
     await _safe_delete(info_msg)
     title    = info.get("title", "Без названия")
     duration = info.get("duration", 0)
-    mins     = duration // 60
-    secs     = duration % 60
+    mins, secs = divmod(duration, 60)
 
     await state.update_data(url=url, title=title)
     await state.set_state(Download.waiting_type)
@@ -650,7 +738,6 @@ async def download_got_url(msg: Message, state: FSMContext):
         reply_markup=download_type_kb(),
         parse_mode="HTML"
     )
-    # Сохраняем id сообщения с выбором типа, чтобы удалить после выбора
     await state.update_data(type_msg_id=type_msg.message_id)
 
 
@@ -674,148 +761,81 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-
-    # ── Удаляем сообщение с выбором типа ─────────────────────────
     await _safe_delete(call.message)
 
-    uid     = call.from_user.id
-    tracker = ProgressTracker()
+    uid         = call.from_user.id
+    user_is_vip = is_vip(uid)
+    tracker     = ProgressTracker()
 
-    # ── Стартовое сообщение-статус ────────────────────────────────
-    LABELS = {
-        "dl_thumb": "Скачиваю превью",
-        "dl_audio": "Скачиваю аудио",
-        "dl_video": "Скачиваю видео",
-    }
+    LABELS = {"dl_thumb": "Скачиваю превью", "dl_audio": "Скачиваю аудио", "dl_video": "Скачиваю видео"}
     label      = LABELS[dl_type]
     status_msg = await bot.send_message(
-        uid,
-        f"⠋ <b>{label}</b>\n\n<code>[░░░░░░░░░░] 0%</code>",
-        parse_mode="HTML"
+        uid, f"⠋ <b>{label}</b>\n\n<code>[░░░░░░░░░░] 0%</code>", parse_mode="HTML"
     )
 
-    stop_anim  = asyncio.Event()
-    anim_task  = asyncio.create_task(
-        _animate_progress(status_msg, tracker, stop_anim, label)
-    )
+    stop_anim = asyncio.Event()
+    anim_task = asyncio.create_task(_animate_progress(status_msg, tracker, stop_anim, label))
 
     tmp = tempfile.mkdtemp(dir=TEMP_DIR)
 
+    # Рекламная подпись только для не-ВИП
+    ad_suffix = "" if user_is_vip else BOT_AD_TEXT
+
     try:
-        # ── Превью ────────────────────────────────────────────────
         if dl_type == "dl_thumb":
             path = await download_thumbnail(url, tmp)
-            stop_anim.set()
-            await anim_task
-
+            stop_anim.set(); await anim_task
             if not path:
-                await status_msg.edit_text("❌ Не удалось скачать превью. Попробуйте другое видео.")
-                return
-
+                await status_msg.edit_text("❌ Не удалось скачать превью."); return
             await _safe_delete(status_msg)
-            await bot.send_photo(
-                uid,
-                FSInputFile(path),
-                caption=f"🖼 <b>Превью</b>\n📹 {title}",
-                parse_mode="HTML"
-            )
+            await bot.send_photo(uid, FSInputFile(path),
+                                 caption=f"🖼 <b>Превью</b>\n📹 {title}{ad_suffix}",
+                                 parse_mode="HTML")
 
-        # ── Аудио ─────────────────────────────────────────────────
         elif dl_type == "dl_audio":
             path, info = await download_audio(url, tmp, tracker)
-            stop_anim.set()
-            await anim_task
-
+            stop_anim.set(); await anim_task
             if not path:
-                await status_msg.edit_text(
-                    "❌ Не удалось скачать аудио.\n"
-                    "Попробуйте другое видео или другой формат."
-                )
-                return
-
+                await status_msg.edit_text("❌ Не удалось скачать аудио."); return
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_SIZE_MB:
-                await status_msg.edit_text(
-                    f"❌ Файл слишком большой ({size_mb:.1f} МБ).\n"
-                    f"Максимум: {MAX_FILE_SIZE_MB} МБ"
-                )
-                return
-
+                await status_msg.edit_text(f"❌ Файл слишком большой ({size_mb:.1f} МБ).\nМаксимум: {MAX_FILE_SIZE_MB} МБ"); return
             await status_msg.edit_text("📤 <b>Отправляю аудио...</b>", parse_mode="HTML")
             duration = info.get("duration", 0)
-            fname    = os.path.basename(path)
-            await bot.send_audio(
-                uid,
-                FSInputFile(path, filename=fname),
-                title=title,
-                duration=int(duration) if duration else None,
-                caption=f"🎵 <b>{title}</b>",
-                parse_mode="HTML"
-            )
+            await bot.send_audio(uid, FSInputFile(path, filename=os.path.basename(path)),
+                                 title=title, duration=int(duration) if duration else None,
+                                 caption=f"🎵 <b>{title}</b>{ad_suffix}", parse_mode="HTML")
             await _safe_delete(status_msg)
 
-        # ── Видео ─────────────────────────────────────────────────
         elif dl_type == "dl_video":
             path, info = await download_video(url, tmp, tracker)
-            stop_anim.set()
-            await anim_task
-
+            stop_anim.set(); await anim_task
             if not path:
-                await status_msg.edit_text(
-                    "❌ Не удалось скачать видео.\n"
-                    "Попробуйте другое видео или скачайте только звук."
-                )
-                return
-
+                await status_msg.edit_text("❌ Не удалось скачать видео."); return
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_SIZE_MB:
-                await status_msg.edit_text(
-                    f"❌ Видео слишком большое ({size_mb:.1f} МБ).\n"
-                    f"Максимум: {MAX_FILE_SIZE_MB} МБ.\n\n"
-                    f"💡 Попробуйте скачать только аудио."
-                )
-                return
-
+                await status_msg.edit_text(f"❌ Видео слишком большое ({size_mb:.1f} МБ).\nМаксимум: {MAX_FILE_SIZE_MB} МБ.\n\n💡 Попробуйте скачать только аудио."); return
             await status_msg.edit_text("📤 <b>Отправляю видео...</b>", parse_mode="HTML")
             duration = info.get("duration", 0)
-            await bot.send_video(
-                uid,
-                FSInputFile(path),
-                duration=int(duration) if duration else None,
-                caption=f"🎬 <b>{title}</b>",
-                parse_mode="HTML"
-            )
+            await bot.send_video(uid, FSInputFile(path),
+                                 duration=int(duration) if duration else None,
+                                 caption=f"🎬 <b>{title}</b>{ad_suffix}", parse_mode="HTML")
             await _safe_delete(status_msg)
 
         inc_downloads(uid)
-
-        if not is_vip(uid):
-            await bot.send_message(
-                uid,
-                f"💡 <i>Хотите без рекламы и без обязательных подписок?\n"
-                f"Активируйте ВИП за {VIP_PRICE_STARS} ⭐ звёзд в месяц!</i>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="👑 Купить ВИП", callback_data="buy_vip")
-                ]]),
-                parse_mode="HTML"
-            )
+        await _post_download_ads(uid)
 
     except Exception as e:
         stop_anim.set()
-        try:
-            await anim_task
-        except Exception:
-            pass
+        try: await anim_task
+        except Exception: pass
         logger.error(f"Ошибка загрузки: {e}")
         try:
             await status_msg.edit_text(
-                f"❌ Произошла ошибка при загрузке.\n"
-                f"Попробуйте позже или другую ссылку.\n\n"
-                f"<code>{str(e)[:200]}</code>",
-                parse_mode="HTML"
+                f"❌ Произошла ошибка при загрузке.\nПопробуйте позже или другую ссылку.\n\n"
+                f"<code>{str(e)[:200]}</code>", parse_mode="HTML"
             )
-        except Exception:
-            pass
+        except Exception: pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -824,56 +844,57 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
 
 @router.message(F.text == "👑 ВИП подписка")
 async def vip_menu(msg: Message):
-    uid = msg.from_user.id
+    uid        = msg.from_user.id
     vip_active = is_vip(uid)
     expires    = vip_expires_str(uid)
-
-    user = get_user(uid)
-    ref_count = user[5] if user else 0
-    ref_used  = user[6] if user else 0
+    user       = get_user(uid)
+    ref_count  = user[5] if user else 0
+    ref_used   = user[6] if user else 0
 
     status_line = (
-        f"✅ Статус: <b>ВИП активен</b>\n"
-        f"⏳ Истекает: {expires}"
-        if vip_active else
-        "❌ Статус: <b>Не активен</b>"
+        f"✅ Статус: <b>ВИП активен</b>\n⏳ Истекает: {expires}"
+        if vip_active else "❌ Статус: <b>Не активен</b>"
     )
-
     ref_line = (
-        f"✅ Реферальная акция использована"
-        if ref_used else
-        f"👥 Ваши рефералы: <b>{ref_count}/{REF_INVITE_COUNT}</b>"
+        "✅ Реферальная акция использована" if ref_used
+        else f"👥 Ваши рефералы: <b>{ref_count}/{REF_INVITE_COUNT}</b>"
     )
 
     await msg.answer(
         f"👑 <b>ВИП подписка</b>\n\n"
         f"{status_line}\n\n"
         f"<b>Что даёт ВИП:</b>\n"
-        f"• 🚫 Никакой рекламы\n"
+        f"• 🚫 Никакой рекламы в подписях\n"
+        f"• 📣 Никаких рекламных постов после скачки\n"
         f"• 📢 Никаких обязательных подписок\n"
         f"• 🔕 Никаких рассылок\n\n"
         f"💰 Цена: <b>{VIP_PRICE_STARS} ⭐ звёзд / месяц</b>\n\n"
         f"🎁 <b>Бесплатный ВИП:</b>\n"
         f"Пригласи {REF_INVITE_COUNT} друзей → {REF_VIP_DAYS} дней ВИП бесплатно\n"
         f"{ref_line}",
-        reply_markup=vip_kb(),
+        reply_markup=vip_kb(uid),
         parse_mode="HTML"
     )
 
 
-# ─── Оплата звёздами ──────────────────────────────────────────────
+@router.callback_query(F.data == "vip_already_active")
+async def vip_already_active_cb(call: CallbackQuery):
+    expires = vip_expires_str(call.from_user.id)
+    await call.answer(f"✅ У вас уже активен ВИП!\nДействует: {expires}", show_alert=True)
+
 
 @router.callback_query(F.data == "buy_vip")
 async def buy_vip_cb(call: CallbackQuery):
     uid = call.from_user.id
+    if is_vip(uid):
+        expires = vip_expires_str(uid)
+        await call.answer(f"✅ У вас уже активен ВИП!\nДействует: {expires}", show_alert=True)
+        return
     prices = [LabeledPrice(label="ВИП подписка на месяц", amount=VIP_PRICE_STARS)]
     await bot.send_invoice(
-        chat_id=uid,
-        title="👑 ВИП подписка",
+        chat_id=uid, title="👑 ВИП подписка",
         description=f"ВИП на {VIP_DAYS} дней — без рекламы и обязательных подписок",
-        payload=f"vip_{uid}_{VIP_DAYS}",
-        currency="XTR",
-        prices=prices,
+        payload=f"vip_{uid}_{VIP_DAYS}", currency="XTR", prices=prices,
     )
     await call.answer()
 
@@ -886,27 +907,19 @@ async def pre_checkout(query: PreCheckoutQuery):
 @router.message(F.successful_payment)
 async def payment_done(msg: Message):
     uid = msg.from_user.id
-    payload = msg.successful_payment.invoice_payload
-
     with get_db() as c:
         c.execute(
             "INSERT INTO stars_payments (user_id,stars,payload,created_at) VALUES (?,?,?,?)",
             (uid, msg.successful_payment.total_amount,
-             payload, datetime.now().strftime("%Y-%m-%d %H:%M"))
+             msg.successful_payment.invoice_payload, datetime.now().strftime("%Y-%m-%d %H:%M"))
         )
-
     expires = give_vip(uid, VIP_DAYS)
     exp_str = datetime.strptime(expires, "%Y-%m-%d %H:%M").strftime("%d.%m.%Y %H:%M")
     await msg.answer(
-        f"🎉 <b>ВИП активирован!</b>\n\n"
-        f"⏳ Действует до: <b>{exp_str}</b>\n\n"
-        f"Наслаждайтесь без рекламы! 🚀",
-        reply_markup=main_kb(uid),
-        parse_mode="HTML"
+        f"🎉 <b>ВИП активирован!</b>\n\n⏳ Действует до: <b>{exp_str}</b>\n\nНаслаждайтесь без рекламы! 🚀",
+        reply_markup=main_kb(uid), parse_mode="HTML"
     )
 
-
-# ─── Реферальная программа ────────────────────────────────────────
 
 @router.callback_query(F.data == "ref_program")
 async def ref_program(call: CallbackQuery):
@@ -914,15 +927,10 @@ async def ref_program(call: CallbackQuery):
     user = get_user(uid)
     ref_count = user[5] if user else 0
     ref_used  = user[6] if user else 0
-
     link = await create_start_link(bot, str(uid), encode=False)
 
     if ref_used:
-        text = (
-            f"🎁 <b>Реферальная программа</b>\n\n"
-            f"✅ Вы уже использовали эту акцию.\n\n"
-            f"🔗 Ваша реферальная ссылка:\n<code>{link}</code>"
-        )
+        text = f"🎁 <b>Реферальная программа</b>\n\n✅ Вы уже использовали эту акцию.\n\n🔗 Ваша ссылка:\n<code>{link}</code>"
     else:
         need = REF_INVITE_COUNT - ref_count
         text = (
@@ -934,54 +942,32 @@ async def ref_program(call: CallbackQuery):
             f"🔗 Ваша ссылка:\n<code>{link}</code>"
         )
 
-    btns = [[InlineKeyboardButton(
-        text="📤 Поделиться",
-        url=f"https://t.me/share/url?url={link}&text=Качай+видео+с+YouTube+в+Telegram!"
-    )]]
+    btns = [[InlineKeyboardButton(text="📤 Поделиться",
+             url=f"https://t.me/share/url?url={link}&text=Качай+видео+с+YouTube+в+Telegram!")]]
     if not ref_used and ref_count >= REF_INVITE_COUNT:
         btns.insert(0, [InlineKeyboardButton(text="🎁 Забрать ВИП!", callback_data="claim_ref_vip")])
-
-    await call.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
-        parse_mode="HTML"
-    )
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "claim_ref_vip")
 async def claim_ref_vip(call: CallbackQuery):
     uid  = call.from_user.id
     user = get_user(uid)
-
-    if not user:
-        return await call.answer("Ошибка", show_alert=True)
-    if user[6]:
-        return await call.answer("❌ Вы уже использовали эту акцию!", show_alert=True)
-    if user[5] < REF_INVITE_COUNT:
-        return await call.answer(
-            f"❌ Нужно ещё {REF_INVITE_COUNT - user[5]} рефералов!", show_alert=True
-        )
+    if not user:                          return await call.answer("Ошибка", show_alert=True)
+    if user[6]:                           return await call.answer("❌ Вы уже использовали эту акцию!", show_alert=True)
+    if user[5] < REF_INVITE_COUNT:        return await call.answer(f"❌ Нужно ещё {REF_INVITE_COUNT - user[5]} рефералов!", show_alert=True)
 
     set_ref_used(uid)
     expires = give_vip(uid, REF_VIP_DAYS)
     exp_str = datetime.strptime(expires, "%Y-%m-%d %H:%M").strftime("%d.%m.%Y %H:%M")
-
     await call.answer("🎉 ВИП активирован!", show_alert=True)
-    await call.message.edit_text(
-        f"🎉 <b>ВИП получен за рефералов!</b>\n\n"
-        f"⏳ Действует до: <b>{exp_str}</b>",
-        parse_mode="HTML"
-    )
+    await call.message.edit_text(f"🎉 <b>ВИП получен за рефералов!</b>\n\n⏳ Действует до: <b>{exp_str}</b>", parse_mode="HTML")
 
-
-# ─── 🆘 Поддержка ─────────────────────────────────────────────────
 
 @router.message(F.text == "🆘 Поддержка")
 async def support(msg: Message):
     await msg.answer(
-        f"🆘 <b>Поддержка</b>\n\n"
-        f"По всем вопросам обращайтесь к администратору:\n"
-        f"👨‍💼 {SUPPORT_USERNAME}",
+        f"🆘 <b>Поддержка</b>\n\nПо всем вопросам:\n👨‍💼 {SUPPORT_USERNAME}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✉️ Написать", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")
         ]]),
@@ -995,59 +981,43 @@ async def support(msg: Message):
 
 @router.message(F.text == "⚙️ Админ панель")
 async def admin_panel(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
+    if msg.from_user.id not in ADMIN_IDS: return
     await state.clear()
     total, vip_cnt, dls, new = get_stats()
     await msg.answer(
         f"⚙️ <b>Админ панель</b>\n\n"
         f"👥 Пользователей: {total}  |  Новых сегодня: {new}\n"
-        f"👑 ВИП активных: {vip_cnt}\n"
-        f"📥 Всего скачиваний: {dls}",
-        reply_markup=admin_kb(),
-        parse_mode="HTML"
+        f"👑 ВИП активных: {vip_cnt}\n📥 Всего скачиваний: {dls}",
+        reply_markup=admin_kb(), parse_mode="HTML"
     )
-
-
-def adm_back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")
-    ]])
 
 
 @router.callback_query(F.data == "adm_back")
 async def adm_back(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.clear()
     total, vip_cnt, dls, new = get_stats()
     await call.message.edit_text(
         f"⚙️ <b>Админ панель</b>\n\n"
         f"👥 Пользователей: {total}  |  Новых сегодня: {new}\n"
-        f"👑 ВИП активных: {vip_cnt}\n"
-        f"📥 Всего скачиваний: {dls}",
-        reply_markup=admin_kb(),
-        parse_mode="HTML"
+        f"👑 ВИП активных: {vip_cnt}\n📥 Всего скачиваний: {dls}",
+        reply_markup=admin_kb(), parse_mode="HTML"
     )
 
 
-# ── Статистика ────────────────────────────────────────────────────
-
 @router.callback_query(F.data == "adm_stats")
 async def adm_stats(call: CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     with get_db() as c:
         total   = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         banned  = c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-        vip_cnt = c.execute("SELECT COUNT(*) FROM vip WHERE expires_at > ?",
-                            (datetime.now().strftime("%Y-%m-%d %H:%M"),)).fetchone()[0]
+        vip_cnt = c.execute("SELECT COUNT(*) FROM vip WHERE expires_at > ?", (datetime.now().strftime("%Y-%m-%d %H:%M"),)).fetchone()[0]
         dls     = c.execute("SELECT SUM(downloads) FROM users").fetchone()[0] or 0
         stars   = c.execute("SELECT SUM(stars) FROM stars_payments").fetchone()[0] or 0
         today   = datetime.now().strftime("%Y-%m-%d")
-        new     = c.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?",
-                            (f"{today}%",)).fetchone()[0]
+        new     = c.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)).fetchone()[0]
         chans   = c.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+        ad_cnt  = c.execute("SELECT COUNT(*) FROM ad_posts").fetchone()[0]
     await call.message.edit_text(
         f"📊 <b>Статистика</b>\n\n"
         f"👥 Всего: {total}  |  Сегодня: +{new}\n"
@@ -1055,259 +1025,141 @@ async def adm_stats(call: CallbackQuery):
         f"👑 ВИП активных: {vip_cnt}\n"
         f"📥 Скачиваний: {dls}\n"
         f"⭐ Заработано звёзд: {stars}\n"
-        f"📺 Обяз. каналов: {chans}",
-        reply_markup=adm_back_kb(),
-        parse_mode="HTML"
+        f"📺 Обяз. каналов: {chans}\n"
+        f"📣 Рекламных постов: {ad_cnt}",
+        reply_markup=adm_back_kb(), parse_mode="HTML"
     )
 
-
-# ── Выдать ВИП ────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "adm_give_vip")
 async def adm_give_vip_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.give_vip_uid)
-    await call.message.edit_text(
-        "👑 <b>Выдать ВИП</b>\n\nВведите ID пользователя:",
-        reply_markup=adm_back_kb(),
-        parse_mode="HTML"
-    )
+    await call.message.edit_text("👑 <b>Выдать ВИП</b>\n\nВведите ID пользователя:", reply_markup=adm_back_kb(), parse_mode="HTML")
 
 
 @router.message(AdminState.give_vip_uid)
 async def adm_give_vip_uid(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    try:
-        uid = int(msg.text.strip())
-    except ValueError:
-        return await msg.answer("❌ Введите числовой ID!")
-
+    if msg.from_user.id not in ADMIN_IDS: return
+    try: uid = int(msg.text.strip())
+    except ValueError: return await msg.answer("❌ Введите числовой ID!")
     user = get_user(uid)
-    if not user:
-        return await msg.answer("❌ Пользователь не найден!")
-
+    if not user: return await msg.answer("❌ Пользователь не найден!")
     await state.update_data(vip_target=uid)
     await state.set_state(AdminState.give_vip_days)
-    await msg.answer(
-        f"👤 Пользователь: {user[2]} (ID: {uid})\n"
-        f"⏳ Текущий ВИП: {vip_expires_str(uid)}\n\n"
-        f"Введите количество дней ВИП:"
-    )
+    await msg.answer(f"👤 {user[2]} (ID: {uid})\n⏳ ВИП: {vip_expires_str(uid)}\n\nВведите кол-во дней:")
 
 
 @router.message(AdminState.give_vip_days)
 async def adm_give_vip_days(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
+    if msg.from_user.id not in ADMIN_IDS: return
     try:
         days = int(msg.text.strip())
-        if days <= 0:
-            raise ValueError
-    except ValueError:
-        return await msg.answer("❌ Введите положительное число дней!")
-
+        if days <= 0: raise ValueError
+    except ValueError: return await msg.answer("❌ Введите положительное число дней!")
     data = await state.get_data()
-    uid  = data["vip_target"]
+    uid = data["vip_target"]
     expires = give_vip(uid, days)
     exp_str = datetime.strptime(expires, "%Y-%m-%d %H:%M").strftime("%d.%m.%Y %H:%M")
     await state.clear()
+    try: await bot.send_message(uid, f"👑 Вам выдан ВИП!\n⏳ До: <b>{exp_str}</b>", parse_mode="HTML")
+    except: pass
+    await msg.answer(f"✅ ВИП выдан {uid}\n⏳ До: {exp_str}", reply_markup=main_kb(msg.from_user.id))
 
-    try:
-        await bot.send_message(uid,
-            f"👑 Вам выдан ВИП!\n⏳ Действует до: <b>{exp_str}</b>",
-            parse_mode="HTML")
-    except Exception:
-        pass
-
-    await msg.answer(
-        f"✅ ВИП выдан пользователю {uid}\n"
-        f"⏳ До: {exp_str}",
-        reply_markup=main_kb(msg.from_user.id)
-    )
-
-
-# ── Отобрать ВИП ─────────────────────────────────────────────────
 
 @router.callback_query(F.data == "adm_revoke_vip")
 async def adm_revoke_vip_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.revoke_vip_uid)
-    await call.message.edit_text(
-        "❌ <b>Отобрать ВИП</b>\n\nВведите ID пользователя:",
-        reply_markup=adm_back_kb(),
-        parse_mode="HTML"
-    )
+    await call.message.edit_text("❌ <b>Отобрать ВИП</b>\n\nВведите ID пользователя:", reply_markup=adm_back_kb(), parse_mode="HTML")
 
 
 @router.message(AdminState.revoke_vip_uid)
 async def adm_revoke_vip_uid(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    try:
-        uid = int(msg.text.strip())
-    except ValueError:
-        return await msg.answer("❌ Введите числовой ID!")
-
+    if msg.from_user.id not in ADMIN_IDS: return
+    try: uid = int(msg.text.strip())
+    except ValueError: return await msg.answer("❌ Введите числовой ID!")
     user = get_user(uid)
-    if not user:
-        return await msg.answer("❌ Пользователь не найден!")
-
+    if not user: return await msg.answer("❌ Пользователь не найден!")
     if not is_vip(uid):
         await state.clear()
-        return await msg.answer(
-            f"⚠️ У пользователя <b>{uid}</b> нет активного ВИП.",
-            reply_markup=main_kb(msg.from_user.id),
-            parse_mode="HTML"
-        )
-
+        return await msg.answer(f"⚠️ У пользователя <b>{uid}</b> нет активного ВИП.", reply_markup=main_kb(msg.from_user.id), parse_mode="HTML")
     remove_vip(uid)
     await state.clear()
+    try: await bot.send_message(uid, "❌ <b>Ваш ВИП был отозван администратором.</b>", parse_mode="HTML")
+    except: pass
+    await msg.answer(f"✅ ВИП отобран у <b>{uid}</b>\n👤 {user[2]}", reply_markup=main_kb(msg.from_user.id), parse_mode="HTML")
 
-    try:
-        await bot.send_message(
-            uid,
-            "❌ <b>Ваш ВИП был отозван администратором.</b>",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-    await msg.answer(
-        f"✅ ВИП успешно отобран у пользователя <b>{uid}</b>\n"
-        f"👤 Имя: {user[2]}",
-        reply_markup=main_kb(msg.from_user.id),
-        parse_mode="HTML"
-    )
-
-
-# ── Цена ВИП ─────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "adm_vip_price")
 async def adm_vip_price(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.set_vip_price)
-    await call.message.edit_text(
-        f"💰 <b>Изменить цену ВИП</b>\n\n"
-        f"Текущая цена: <b>{VIP_PRICE_STARS} ⭐</b>\n\n"
-        f"Отправьте новую цену:",
-        reply_markup=adm_back_kb(),
-        parse_mode="HTML"
-    )
+    await call.message.edit_text(f"💰 <b>Изменить цену ВИП</b>\n\nТекущая: <b>{VIP_PRICE_STARS} ⭐</b>\n\nНовая цена:", reply_markup=adm_back_kb(), parse_mode="HTML")
 
 
 @router.message(AdminState.set_vip_price)
 async def adm_set_vip_price(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
+    if msg.from_user.id not in ADMIN_IDS: return
     try:
         new_price = int(msg.text.strip())
-        if new_price <= 0:
-            raise ValueError
-    except ValueError:
-        return await msg.answer("❌ Введите положительное целое число!")
-
+        if new_price <= 0: raise ValueError
+    except ValueError: return await msg.answer("❌ Введите положительное целое число!")
     global VIP_PRICE_STARS
     VIP_PRICE_STARS = new_price
     await state.clear()
-    await msg.answer(
-        f"✅ Цена ВИП изменена на <b>{new_price} ⭐</b>",
-        reply_markup=main_kb(msg.from_user.id),
-        parse_mode="HTML"
-    )
+    await msg.answer(f"✅ Цена изменена на <b>{new_price} ⭐</b>", reply_markup=main_kb(msg.from_user.id), parse_mode="HTML")
 
 
 # ── Рассылка ─────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "adm_broadcast")
 async def adm_bc_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.bc_content)
     await call.message.edit_text(
-        "📢 <b>Рассылка — шаг 1/2</b>\n\n"
-        "Отправьте сообщение для рассылки.\n"
-        "Можно: текст, фото с подписью, видео с подписью.\n\n"
-        "⚠️ ВИП пользователи рассылку <b>не получат</b>.",
-        reply_markup=adm_back_kb(),
-        parse_mode="HTML"
+        "📢 <b>Рассылка — шаг 1/2</b>\n\nОтправьте сообщение.\nМожно: текст, фото, видео.\n\n⚠️ ВИП пользователи <b>не получат</b>.",
+        reply_markup=adm_back_kb(), parse_mode="HTML"
     )
 
 
 @router.message(AdminState.bc_content)
 async def adm_bc_content(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-
-    if msg.photo:
-        bc_type = "photo"
-        file_id = msg.photo[-1].file_id
-        caption = msg.caption or ""
-    elif msg.video:
-        bc_type = "video"
-        file_id = msg.video.file_id
-        caption = msg.caption or ""
-    elif msg.text:
-        bc_type = "text"
-        file_id = None
-        caption = msg.text
-    else:
-        return await msg.answer("❌ Поддерживаются: текст, фото, видео.")
-
+    if msg.from_user.id not in ADMIN_IDS: return
+    if msg.photo:    bc_type, file_id, caption = "photo", msg.photo[-1].file_id, msg.caption or ""
+    elif msg.video:  bc_type, file_id, caption = "video", msg.video.file_id,     msg.caption or ""
+    elif msg.text:   bc_type, file_id, caption = "text",  None,                  msg.text
+    else:            return await msg.answer("❌ Поддерживаются: текст, фото, видео.")
     await state.update_data(bc_type=bc_type, bc_file_id=file_id, bc_caption=caption)
     await state.set_state(AdminState.bc_buttons)
-
     await msg.answer(
-        "📢 <b>Рассылка — шаг 2/2</b>\n\n"
-        "Добавьте inline-кнопки (необязательно).\n"
-        "Формат:\n<code>Текст|https://ссылка.com</code>\n\n"
-        "Каждая кнопка на новой строке.\n"
-        "Или напишите <b>нет</b> чтобы без кнопок.",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="нет")]],
-            resize_keyboard=True
-        ),
+        "📢 <b>Рассылка — шаг 2/2</b>\n\nДобавьте кнопки (необязательно).\n"
+        "Формат: <code>Текст|https://ссылка</code>\n\nКаждая кнопка на новой строке.\nИли <b>нет</b>.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="нет")]], resize_keyboard=True),
         parse_mode="HTML"
     )
 
 
 @router.message(AdminState.bc_buttons)
 async def adm_bc_buttons(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-
+    if msg.from_user.id not in ADMIN_IDS: return
     buttons_raw = None if msg.text.strip().lower() in ("нет", "/skip", "skip") else msg.text
     await state.update_data(bc_buttons=buttons_raw)
-    data = await state.get_data()
-
-    all_users = all_user_ids()
-    non_vip   = [u for u in all_users if not is_vip(u)]
-
+    data      = await state.get_data()
+    non_vip   = [u for u in all_user_ids() if not is_vip(u)]
     await state.set_state(AdminState.bc_confirm)
     await msg.answer(
-        f"📢 <b>Предпросмотр рассылки</b>\n\n"
-        f"📝 Тип: {data['bc_type']}\n"
-        f"🔘 Кнопки: {'есть' if buttons_raw else 'нет'}\n"
-        f"👥 Получателей: {len(non_vip)} (ВИП не получат)\n\n"
-        f"Начать рассылку?",
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode="HTML"
+        f"📢 <b>Предпросмотр</b>\n\n📝 Тип: {data['bc_type']}\n🔘 Кнопки: {'есть' if buttons_raw else 'нет'}\n👥 Получателей: {len(non_vip)}\n\nНачать рассылку?",
+        reply_markup=ReplyKeyboardRemove(), parse_mode="HTML"
     )
-    await msg.answer(
-        "Подтвердите:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Начать", callback_data="bc_go")],
-            [InlineKeyboardButton(text="❌ Отмена",  callback_data="bc_cancel")],
-        ])
-    )
+    await msg.answer("Подтвердите:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Начать", callback_data="bc_go")],
+        [InlineKeyboardButton(text="❌ Отмена",  callback_data="bc_cancel")],
+    ]))
 
 
 def parse_buttons(raw: str | None) -> InlineKeyboardMarkup | None:
-    if not raw:
-        return None
+    if not raw: return None
     rows = []
     for line in raw.strip().splitlines():
         if "|" in line:
@@ -1318,37 +1170,23 @@ def parse_buttons(raw: str | None) -> InlineKeyboardMarkup | None:
 
 @router.callback_query(F.data == "bc_go")
 async def bc_go(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     data = await state.get_data()
     await state.clear()
-
-    bc_type   = data.get("bc_type")
-    file_id   = data.get("bc_file_id")
-    caption   = data.get("bc_caption", "")
-    kb        = parse_buttons(data.get("bc_buttons"))
+    bc_type = data.get("bc_type"); file_id = data.get("bc_file_id")
+    caption = data.get("bc_caption", ""); kb = parse_buttons(data.get("bc_buttons"))
     all_users = [u for u in all_user_ids() if not is_vip(u)]
-
     await call.message.edit_text(f"⏳ Рассылаю {len(all_users)} пользователям...")
-
     ok, fail = 0, 0
     for uid in all_users:
         try:
-            if bc_type == "photo":
-                await bot.send_photo(uid, file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
-            elif bc_type == "video":
-                await bot.send_video(uid, file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
-            else:
-                await bot.send_message(uid, caption, reply_markup=kb, parse_mode="HTML")
+            if bc_type == "photo":   await bot.send_photo(uid, file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+            elif bc_type == "video": await bot.send_video(uid, file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+            else:                    await bot.send_message(uid, caption, reply_markup=kb, parse_mode="HTML")
             ok += 1
-        except Exception:
-            fail += 1
+        except Exception: fail += 1
         await asyncio.sleep(0.04)
-
-    await call.message.edit_text(
-        f"✅ Рассылка завершена!\n📨 Доставлено: {ok}/{len(all_users)}  ❌ Ошибок: {fail}",
-        reply_markup=adm_back_kb()
-    )
+    await call.message.edit_text(f"✅ Рассылка завершена!\n📨 {ok}/{len(all_users)}  ❌ {fail}", reply_markup=adm_back_kb())
     await call.message.answer("Меню:", reply_markup=main_kb(call.from_user.id))
 
 
@@ -1362,40 +1200,29 @@ async def bc_cancel(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "adm_channels")
 async def adm_channels(call: CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     chs  = get_channels()
     text = "📺 <b>Обязательные подписки</b>\n\n"
     text += "\n".join(f"• {ch[2]}  ({ch[1]})" for ch in chs) if chs else "Каналы не добавлены."
-
     rows = [[InlineKeyboardButton(text="➕ Добавить", callback_data="ch_add")]]
     for ch in chs:
         rows.append([InlineKeyboardButton(text=f"🗑 {ch[2]}", callback_data=f"ch_del_{ch[0]}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")])
-
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "ch_add")
 async def ch_add_prompt(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.add_channel)
-    await call.message.answer(
-        "➕ Введите данные канала:\n"
-        "<code>@channel_id|Название|https://t.me/channel</code>\n\n"
-        "⚠️ Бот должен быть администратором в канале!",
-        parse_mode="HTML"
-    )
+    await call.message.answer("➕ Введите:\n<code>@channel_id|Название|https://t.me/channel</code>", parse_mode="HTML")
 
 
 @router.message(AdminState.add_channel)
 async def ch_add_handler(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
+    if msg.from_user.id not in ADMIN_IDS: return
     parts = msg.text.split("|")
-    if len(parts) != 3:
-        return await msg.answer("❌ Формат: @channel|Название|https://ссылка")
+    if len(parts) != 3: return await msg.answer("❌ Формат: @channel|Название|https://ссылка")
     add_channel(parts[0].strip(), parts[1].strip(), parts[2].strip())
     await state.clear()
     await msg.answer("✅ Канал добавлен!", reply_markup=main_kb(msg.from_user.id))
@@ -1403,39 +1230,26 @@ async def ch_add_handler(msg: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("ch_del_"))
 async def ch_del(call: CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     del_channel(int(call.data.split("_")[2]))
     await call.answer("✅ Канал удалён!")
     await adm_channels(call)
 
 
-# ── Бан / Разбан ─────────────────────────────────────────────────
-
 @router.callback_query(F.data == "adm_ban")
 async def adm_ban_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMIN_IDS:
-        return
+    if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.ban_uid)
-    await call.message.edit_text(
-        "🚫 <b>Бан/Разбан</b>\n\nВведите ID пользователя:",
-        reply_markup=adm_back_kb(),
-        parse_mode="HTML"
-    )
+    await call.message.edit_text("🚫 <b>Бан/Разбан</b>\n\nВведите ID:", reply_markup=adm_back_kb(), parse_mode="HTML")
 
 
 @router.message(AdminState.ban_uid)
 async def adm_ban_uid(msg: Message, state: FSMContext):
-    if msg.from_user.id not in ADMIN_IDS:
-        return
-    try:
-        uid = int(msg.text.strip())
-    except ValueError:
-        return await msg.answer("❌ Введите числовой ID!")
-
+    if msg.from_user.id not in ADMIN_IDS: return
+    try: uid = int(msg.text.strip())
+    except ValueError: return await msg.answer("❌ Введите числовой ID!")
     new_status = ban_toggle(uid)
     await state.clear()
-
     if new_status == 1:
         action = "🚫 Заблокирован"
         try: await bot.send_message(uid, "🚫 Ваш аккаунт заблокирован.")
@@ -1444,10 +1258,185 @@ async def adm_ban_uid(msg: Message, state: FSMContext):
         action = "✅ Разблокирован"
         try: await bot.send_message(uid, "✅ Ваш аккаунт разблокирован.")
         except: pass
-    else:
-        action = "❌ Пользователь не найден"
-
+    else: action = "❌ Пользователь не найден"
     await msg.answer(f"{action}: {uid}", reply_markup=main_kb(msg.from_user.id))
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║                   📣  РЕКЛАМНЫЕ ПОСТЫ (ADMIN)                  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+@router.callback_query(F.data == "adm_adposts")
+async def adm_adposts(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: return
+    await state.clear()
+    posts = get_ad_posts()
+    text = (
+        f"📣 <b>Рекламные посты</b>\n\n"
+        f"Всего: <b>{len(posts)}</b> шт.\n"
+        f"После каждой скачки случайный пост отправляется не-ВИП пользователям.\n\n"
+        f"🗑<i>N</i>с — автоудаление через N секунд\n"
+        f"♾ — не удаляется"
+    )
+    await call.message.edit_text(text, reply_markup=_adpost_list_kb(posts), parse_mode="HTML")
+
+
+# ── Добавить / редактировать — шаг 1: контент ────────────────────
+
+@router.callback_query(F.data == "adp_add")
+async def adp_add_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: return
+    await state.set_state(AdminState.adpost_content)
+    await state.update_data(adp_mode="add", adp_edit_id=None)
+    await call.message.answer(
+        "📣 <b>Новый рекламный пост — шаг 1/3</b>\n\n"
+        "Отправьте содержимое поста:\n"
+        "текст, фото с подписью или видео с подписью.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("adp_edit_"))
+async def adp_edit_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS: return
+    post_id = int(call.data.split("_")[2])
+    post    = get_ad_post(post_id)
+    if not post:
+        await call.answer("❌ Пост не найден!", show_alert=True); return
+
+    _, post_type, file_id, caption, buttons, auto_del, _ = post
+    del_text  = f"{auto_del} сек." if auto_del else "нет"
+    btns_text = buttons if buttons else "нет"
+
+    await call.message.answer(
+        f"✏️ <b>Редактировать пост #{post_id}</b>\n\n"
+        f"Тип: {post_type}\n"
+        f"Подпись:\n<code>{(caption or '')[:300]}</code>\n\n"
+        f"Кнопки:\n<code>{btns_text[:200]}</code>\n\n"
+        f"Автоудаление: {del_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Отправьте новое содержимое поста:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True
+        )
+    )
+    await state.set_state(AdminState.adpost_content)
+    await state.update_data(adp_mode="edit", adp_edit_id=post_id)
+
+
+@router.message(AdminState.adpost_content)
+async def adp_got_content(msg: Message, state: FSMContext):
+    if msg.from_user.id not in ADMIN_IDS: return
+    if msg.text == "❌ Отмена":
+        await state.clear()
+        await msg.answer("Отменено.", reply_markup=main_kb(msg.from_user.id))
+        return
+
+    if msg.photo:    post_type, file_id, caption = "photo", msg.photo[-1].file_id, msg.caption or ""
+    elif msg.video:  post_type, file_id, caption = "video", msg.video.file_id,     msg.caption or ""
+    elif msg.text:   post_type, file_id, caption = "text",  None,                  msg.text
+    else:            return await msg.answer("❌ Поддерживаются: текст, фото, видео.")
+
+    await state.update_data(adp_type=post_type, adp_file_id=file_id, adp_caption=caption)
+    await state.set_state(AdminState.adpost_buttons)
+    await msg.answer(
+        "📣 <b>Шаг 2/3 — Кнопки</b>\n\n"
+        "Добавьте inline-кнопки (необязательно).\n"
+        "Каждая кнопка на новой строке:\n"
+        "<code>Текст кнопки|https://ссылка.com</code>\n\n"
+        "Или напишите <b>нет</b>.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="нет")], [KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminState.adpost_buttons)
+async def adp_got_buttons(msg: Message, state: FSMContext):
+    if msg.from_user.id not in ADMIN_IDS: return
+    if msg.text == "❌ Отмена":
+        await state.clear()
+        await msg.answer("Отменено.", reply_markup=main_kb(msg.from_user.id))
+        return
+
+    buttons_raw = None if msg.text.strip().lower() in ("нет", "no") else msg.text
+    await state.update_data(adp_buttons=buttons_raw)
+    await state.set_state(AdminState.adpost_delete)
+    await msg.answer(
+        "📣 <b>Шаг 3/3 — Автоудаление</b>\n\n"
+        "Через сколько секунд удалять пост у пользователя?\n\n"
+        "• <code>0</code> — не удалять\n"
+        "• <code>60</code> — через 1 минуту\n"
+        "• <code>300</code> — через 5 минут\n"
+        "• <code>3600</code> — через 1 час",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="0"), KeyboardButton(text="60"), KeyboardButton(text="300")],
+                      [KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminState.adpost_delete)
+async def adp_got_delete(msg: Message, state: FSMContext):
+    if msg.from_user.id not in ADMIN_IDS: return
+    if msg.text == "❌ Отмена":
+        await state.clear()
+        await msg.answer("Отменено.", reply_markup=main_kb(msg.from_user.id))
+        return
+
+    try:
+        auto_del = int(msg.text.strip())
+        if auto_del < 0: raise ValueError
+    except ValueError:
+        return await msg.answer("❌ Введите 0 или количество секунд (целое ≥ 0).")
+
+    data      = await state.get_data()
+    mode      = data.get("adp_mode", "add")
+    edit_id   = data.get("adp_edit_id")
+    post_type = data["adp_type"]
+    file_id   = data.get("adp_file_id")
+    caption   = data["adp_caption"]
+    buttons   = data.get("adp_buttons")
+    await state.clear()
+
+    if mode == "edit" and edit_id:
+        update_ad_post(edit_id, post_type, file_id, caption, buttons, auto_del)
+        action_text = f"✅ Рекламный пост #{edit_id} обновлён!"
+    else:
+        add_ad_post(post_type, file_id, caption, buttons, auto_del)
+        action_text = "✅ Рекламный пост добавлен!"
+
+    del_text = f"🗑 Автоудаление: через {auto_del} сек." if auto_del > 0 else "🗑 Автоудаление: отключено"
+    await msg.answer(
+        f"{action_text}\n\n"
+        f"📝 Тип: {post_type}\n"
+        f"🔘 Кнопки: {'есть' if buttons else 'нет'}\n"
+        f"{del_text}",
+        reply_markup=main_kb(msg.from_user.id),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("adp_del_"))
+async def adp_delete(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: return
+    post_id = int(call.data.split("_")[2])
+    delete_ad_post(post_id)
+    await call.answer(f"✅ Пост #{post_id} удалён!")
+    posts = get_ad_posts()
+    text = f"📣 <b>Рекламные посты</b>\n\nВсего: <b>{len(posts)}</b> шт."
+    try:
+        await call.message.edit_text(text, reply_markup=_adpost_list_kb(posts), parse_mode="HTML")
+    except Exception:
+        pass
 
 
 # ─── Фоновая задача — снятие истёкших ВИП ────────────────────────
@@ -1456,10 +1445,7 @@ async def vip_cleanup_loop():
     while True:
         try:
             with get_db() as c:
-                c.execute(
-                    "DELETE FROM vip WHERE expires_at <= ?",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M"),)
-                )
+                c.execute("DELETE FROM vip WHERE expires_at <= ?", (datetime.now().strftime("%Y-%m-%d %H:%M"),))
         except Exception as e:
             logger.error(f"VIP cleanup error: {e}")
         await asyncio.sleep(3600)
