@@ -22,7 +22,7 @@ VIP_DAYS         = 30
 REF_INVITE_COUNT = 3
 REF_VIP_DAYS     = 7
 
-MAX_FILE_SIZE_MB = 50
+MAX_FILE_SIZE_MB = 100
 
 # ═══════════════════════════════════════════════════════════════════
 
@@ -187,7 +187,6 @@ def is_vip(uid: int) -> bool:
     return datetime.strptime(row[1], "%Y-%m-%d %H:%M") > datetime.now()
 
 def give_vip(uid: int, days: int):
-    """Выдать или продлить VIP"""
     now = datetime.now()
     existing = get_vip(uid)
     if existing:
@@ -201,7 +200,6 @@ def give_vip(uid: int, days: int):
     return expires
 
 def remove_vip(uid: int):
-    """Отобрать ВИП у пользователя"""
     with get_db() as c:
         c.execute("DELETE FROM vip WHERE user_id=?", (uid,))
 
@@ -263,7 +261,7 @@ class AdminState(StatesGroup):
     add_channel     = State()
     ban_uid         = State()
     set_vip_price   = State()
-    revoke_vip_uid  = State()   # ← отобрать ВИП
+    revoke_vip_uid  = State()
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -322,11 +320,91 @@ def admin_kb():
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║              🎬  АНИМАЦИЯ ЗАГРУЗКИ С ПРОГРЕССОМ                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def _build_progress_bar(percent: float, width: int = 10) -> str:
+    """Строит текстовый прогресс-бар: ██████░░░░ 60%"""
+    filled = int(width * percent / 100)
+    bar    = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {percent:.0f}%"
+
+
+class ProgressTracker:
+    """Хранит текущий прогресс загрузки yt-dlp и метку этапа."""
+    def __init__(self):
+        self.percent: float = 0.0
+        self.stage:   str   = ""
+        self.speed:   str   = ""
+        self.eta:     str   = ""
+
+    def hook(self, d: dict):
+        if d["status"] == "downloading":
+            raw = d.get("_percent_str", "0%").strip().replace("%", "")
+            try:
+                self.percent = float(raw)
+            except ValueError:
+                pass
+            spd = d.get("_speed_str", "").strip()
+            eta = d.get("_eta_str",   "").strip()
+            self.speed = spd if spd and spd != "N/A" else ""
+            self.eta   = eta if eta and eta != "N/A" else ""
+        elif d["status"] == "finished":
+            self.percent = 100.0
+
+
+async def _animate_progress(
+    status_msg: Message,
+    tracker: ProgressTracker,
+    stop_event: asyncio.Event,
+    label: str,
+):
+    """
+    Крутит анимацию пока stop_event не установлен.
+    Каждую секунду обновляет сообщение с актуальным прогрессом.
+    """
+    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    i = 0
+    last_text = ""
+    while not stop_event.is_set():
+        spin  = FRAMES[i % len(FRAMES)]
+        pct   = tracker.percent
+        bar   = _build_progress_bar(pct)
+        speed = f" • {tracker.speed}" if tracker.speed else ""
+        eta   = f" • ETA {tracker.eta}" if tracker.eta else ""
+        text  = (
+            f"{spin} <b>{label}</b>\n\n"
+            f"<code>{bar}</code>\n"
+            f"<i>{pct:.0f}%{speed}{eta}</i>"
+        )
+        if text != last_text:
+            try:
+                await status_msg.edit_text(text, parse_mode="HTML")
+                last_text = text
+            except Exception:
+                pass
+        i += 1
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _safe_delete(msg: Message):
+    """Тихо удаляет сообщение."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║                   🎬  YOUTUBE ФУНКЦИИ                          ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 def is_youtube_url(url: str) -> bool:
     return any(x in url for x in ["youtube.com", "youtu.be", "yt.be"])
+
 
 async def download_thumbnail(url: str, out_dir: str) -> str | None:
     try:
@@ -355,7 +433,10 @@ async def download_thumbnail(url: str, out_dir: str) -> str | None:
         logger.error(f"Ошибка скачивания превью: {e}")
         return None
 
-async def download_audio(url: str, out_dir: str) -> tuple[str | None, dict]:
+
+async def download_audio(
+    url: str, out_dir: str, tracker: ProgressTracker
+) -> tuple[str | None, dict]:
     try:
         ydl_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
@@ -363,6 +444,7 @@ async def download_audio(url: str, out_dir: str) -> tuple[str | None, dict]:
             "quiet": False,
             "no_warnings": False,
             "ignoreerrors": False,
+            "progress_hooks": [tracker.hook],
         }
         info = {}
         loop = asyncio.get_event_loop()
@@ -383,14 +465,18 @@ async def download_audio(url: str, out_dir: str) -> tuple[str | None, dict]:
         logger.error(f"Ошибка скачивания аудио: {e}")
         return None, {}
 
-async def download_video(url: str, out_dir: str) -> tuple[str | None, dict]:
+
+async def download_video(
+    url: str, out_dir: str, tracker: ProgressTracker
+) -> tuple[str | None, dict]:
     try:
         ydl_opts = {
-            "format": "best[ext=mp4][height<=720]/best[ext=mp4]/best",
+            "format": "best[ext=mp4][height<=1080]/best[ext=mp4]/best",
             "outtmpl": os.path.join(out_dir, "video.%(ext)s"),
             "quiet": False,
             "no_warnings": False,
             "ignoreerrors": False,
+            "progress_hooks": [tracker.hook],
         }
         info = {}
         loop = asyncio.get_event_loop()
@@ -410,6 +496,7 @@ async def download_video(url: str, out_dir: str) -> tuple[str | None, dict]:
     except Exception as e:
         logger.error(f"Ошибка скачивания видео: {e}")
         return None, {}
+
 
 async def get_video_info(url: str) -> dict | None:
     try:
@@ -540,14 +627,14 @@ async def download_got_url(msg: Message, state: FSMContext):
     info = await get_video_info(url)
 
     if not info:
-        await info_msg.delete()
+        await _safe_delete(info_msg)
         return await msg.answer(
             "❌ Не удалось получить информацию.\n"
             "Проверьте ссылку или попробуйте позже.",
             reply_markup=main_kb(msg.from_user.id)
         )
 
-    await info_msg.delete()
+    await _safe_delete(info_msg)
     title    = info.get("title", "Без названия")
     duration = info.get("duration", 0)
     mins     = duration // 60
@@ -555,7 +642,7 @@ async def download_got_url(msg: Message, state: FSMContext):
 
     await state.update_data(url=url, title=title)
     await state.set_state(Download.waiting_type)
-    await msg.answer(
+    type_msg = await msg.answer(
         f"✅ Видео найдено!\n\n"
         f"📹 <b>{title}</b>\n"
         f"⏱ Длительность: {mins}:{secs:02d}\n\n"
@@ -563,6 +650,8 @@ async def download_got_url(msg: Message, state: FSMContext):
         reply_markup=download_type_kb(),
         parse_mode="HTML"
     )
+    # Сохраняем id сообщения с выбором типа, чтобы удалить после выбора
+    await state.update_data(type_msg_id=type_msg.message_id)
 
 
 @router.callback_query(F.data == "dl_cancel")
@@ -574,7 +663,7 @@ async def dl_cancel(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.in_({"dl_video", "dl_thumb", "dl_audio"}))
 async def download_execute(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
+    data    = await state.get_data()
     url     = data.get("url")
     title   = data.get("title", "Видео")
     dl_type = call.data
@@ -585,20 +674,45 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    await call.message.delete()
 
-    uid    = call.from_user.id
-    status = await bot.send_message(uid, "⏳ <b>Загружаю, ожидайте...</b>", parse_mode="HTML")
-    tmp    = tempfile.mkdtemp(dir=TEMP_DIR)
+    # ── Удаляем сообщение с выбором типа ─────────────────────────
+    await _safe_delete(call.message)
+
+    uid     = call.from_user.id
+    tracker = ProgressTracker()
+
+    # ── Стартовое сообщение-статус ────────────────────────────────
+    LABELS = {
+        "dl_thumb": "Скачиваю превью",
+        "dl_audio": "Скачиваю аудио",
+        "dl_video": "Скачиваю видео",
+    }
+    label      = LABELS[dl_type]
+    status_msg = await bot.send_message(
+        uid,
+        f"⠋ <b>{label}</b>\n\n<code>[░░░░░░░░░░] 0%</code>",
+        parse_mode="HTML"
+    )
+
+    stop_anim  = asyncio.Event()
+    anim_task  = asyncio.create_task(
+        _animate_progress(status_msg, tracker, stop_anim, label)
+    )
+
+    tmp = tempfile.mkdtemp(dir=TEMP_DIR)
 
     try:
+        # ── Превью ────────────────────────────────────────────────
         if dl_type == "dl_thumb":
-            await status.edit_text("🖼 Скачиваю превью...")
             path = await download_thumbnail(url, tmp)
-            if not path:
-                return await status.edit_text("❌ Не удалось скачать превью. Попробуйте другое видео.")
+            stop_anim.set()
+            await anim_task
 
-            await status.edit_text("📤 Отправляю...")
+            if not path:
+                await status_msg.edit_text("❌ Не удалось скачать превью. Попробуйте другое видео.")
+                return
+
+            await _safe_delete(status_msg)
             await bot.send_photo(
                 uid,
                 FSInputFile(path),
@@ -606,23 +720,28 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
                 parse_mode="HTML"
             )
 
+        # ── Аудио ─────────────────────────────────────────────────
         elif dl_type == "dl_audio":
-            await status.edit_text("🎵 Скачиваю аудио...")
-            path, info = await download_audio(url, tmp)
+            path, info = await download_audio(url, tmp, tracker)
+            stop_anim.set()
+            await anim_task
+
             if not path:
-                return await status.edit_text(
+                await status_msg.edit_text(
                     "❌ Не удалось скачать аудио.\n"
                     "Попробуйте другое видео или другой формат."
                 )
+                return
 
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_SIZE_MB:
-                return await status.edit_text(
+                await status_msg.edit_text(
                     f"❌ Файл слишком большой ({size_mb:.1f} МБ).\n"
                     f"Максимум: {MAX_FILE_SIZE_MB} МБ"
                 )
+                return
 
-            await status.edit_text("📤 Отправляю аудио...")
+            await status_msg.edit_text("📤 <b>Отправляю аудио...</b>", parse_mode="HTML")
             duration = info.get("duration", 0)
             fname    = os.path.basename(path)
             await bot.send_audio(
@@ -633,25 +752,31 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
                 caption=f"🎵 <b>{title}</b>",
                 parse_mode="HTML"
             )
+            await _safe_delete(status_msg)
 
+        # ── Видео ─────────────────────────────────────────────────
         elif dl_type == "dl_video":
-            await status.edit_text("🎬 Скачиваю видео...")
-            path, info = await download_video(url, tmp)
+            path, info = await download_video(url, tmp, tracker)
+            stop_anim.set()
+            await anim_task
+
             if not path:
-                return await status.edit_text(
+                await status_msg.edit_text(
                     "❌ Не удалось скачать видео.\n"
                     "Попробуйте другое видео или скачайте только звук."
                 )
+                return
 
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_SIZE_MB:
-                return await status.edit_text(
+                await status_msg.edit_text(
                     f"❌ Видео слишком большое ({size_mb:.1f} МБ).\n"
                     f"Максимум: {MAX_FILE_SIZE_MB} МБ.\n\n"
                     f"💡 Попробуйте скачать только аудио."
                 )
+                return
 
-            await status.edit_text("📤 Отправляю видео...")
+            await status_msg.edit_text("📤 <b>Отправляю видео...</b>", parse_mode="HTML")
             duration = info.get("duration", 0)
             await bot.send_video(
                 uid,
@@ -660,8 +785,8 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
                 caption=f"🎬 <b>{title}</b>",
                 parse_mode="HTML"
             )
+            await _safe_delete(status_msg)
 
-        await status.delete()
         inc_downloads(uid)
 
         if not is_vip(uid):
@@ -676,9 +801,14 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
             )
 
     except Exception as e:
+        stop_anim.set()
+        try:
+            await anim_task
+        except Exception:
+            pass
         logger.error(f"Ошибка загрузки: {e}")
         try:
-            await status.edit_text(
+            await status_msg.edit_text(
                 f"❌ Произошла ошибка при загрузке.\n"
                 f"Попробуйте позже или другую ссылку.\n\n"
                 f"<code>{str(e)[:200]}</code>",
@@ -939,8 +1069,7 @@ async def adm_give_vip_start(call: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminState.give_vip_uid)
     await call.message.edit_text(
-        "👑 <b>Выдать ВИП</b>\n\n"
-        "Введите ID пользователя:",
+        "👑 <b>Выдать ВИП</b>\n\nВведите ID пользователя:",
         reply_markup=adm_back_kb(),
         parse_mode="HTML"
     )
@@ -1007,8 +1136,7 @@ async def adm_revoke_vip_start(call: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminState.revoke_vip_uid)
     await call.message.edit_text(
-        "❌ <b>Отобрать ВИП</b>\n\n"
-        "Введите ID пользователя:",
+        "❌ <b>Отобрать ВИП</b>\n\nВведите ID пользователя:",
         reply_markup=adm_back_kb(),
         parse_mode="HTML"
     )
@@ -1340,6 +1468,11 @@ async def vip_cleanup_loop():
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                         🚀  ЗАПУСК                             ║
 # ╚══════════════════════════════════════════════════════════════════╝
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "🔴 Start bot"),
+    ])
 
 async def main():
     init_db()
