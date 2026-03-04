@@ -1469,11 +1469,6 @@ async def vip_cleanup_loop():
 # ║                         🚀  ЗАПУСК                             ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-async def post_init(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start", "🔴 Start bot"),
-    ])
-
 async def main():
     init_db()
     logger.info("✅ Бот запущен!")
