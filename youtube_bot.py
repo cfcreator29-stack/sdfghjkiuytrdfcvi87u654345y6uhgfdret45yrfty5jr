@@ -668,7 +668,8 @@ async def cmd_admin(msg: Message, state: FSMContext):
 
 
 @router.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext):    await state.clear()
+async def cmd_start(msg: Message, state: FSMContext):
+    await state.clear()
     u = msg.from_user
     args = msg.text.split()
     ref_id = None
