@@ -22,10 +22,10 @@ VIP_DAYS         = 30
 REF_INVITE_COUNT = 3
 REF_VIP_DAYS     = 7
 
-MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE_MB = 200
 
 # Текст рекламы бота, который добавляется к подписи файла (только не-ВИП)
-BOT_AD_TEXT = "\n\n🤖 <b>Скачано через @YourBotUsername</b>\n📥 Скачивай видео, аудио и превью с YouTube бесплатно!"
+BOT_AD_TEXT = "\n\n🤖 <b>Скачано через @FVyoutube_bot</b>\n📥 Скачивай видео, аудио и превью с YouTube бесплатно!"
 
 # ═══════════════════════════════════════════════════════════════════
 
@@ -834,7 +834,13 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
                 await status_msg.edit_text("❌ Не удалось скачать аудио."); return
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_SIZE_MB:
-                await status_msg.edit_text(f"❌ Файл слишком большой ({size_mb:.1f} МБ).\nМаксимум: {MAX_FILE_SIZE_MB} МБ"); return
+                await status_msg.edit_text(
+                    f"❌ <b>Аудио слишком большое</b> ({size_mb:.1f} МБ).\n\n"
+                    f"Telegram разрешает боту отправлять максимум <b>{MAX_FILE_SIZE_MB} МБ</b>.\n\n"
+                    f"💡 Попробуйте более короткое видео.",
+                    parse_mode="HTML"
+                )
+                return
             await status_msg.edit_text("📤 <b>Отправляю аудио...</b>", parse_mode="HTML")
             duration = info.get("duration", 0)
             await bot.send_audio(uid, FSInputFile(path, filename=os.path.basename(path)),
@@ -849,7 +855,13 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
                 await status_msg.edit_text("❌ Не удалось скачать видео."); return
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > MAX_FILE_SIZE_MB:
-                await status_msg.edit_text(f"❌ Видео слишком большое ({size_mb:.1f} МБ).\nМаксимум: {MAX_FILE_SIZE_MB} МБ.\n\n💡 Попробуйте скачать только аудио."); return
+                await status_msg.edit_text(
+                    f"❌ <b>Видео слишком большое</b> ({size_mb:.1f} МБ).\n\n"
+                    f"Telegram разрешает боту отправлять максимум <b>{MAX_FILE_SIZE_MB} МБ</b>.\n\n"
+                    f"💡 Попробуйте скачать только <b>🎵 аудио</b> — оно обычно намного меньше.",
+                    parse_mode="HTML"
+                )
+                return
             await status_msg.edit_text("📤 <b>Отправляю видео...</b>", parse_mode="HTML")
             duration = info.get("duration", 0)
             await bot.send_video(uid, FSInputFile(path),
@@ -865,11 +877,21 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
         try: await anim_task
         except Exception: pass
         logger.error(f"Ошибка загрузки: {e}")
-        try:
-            await status_msg.edit_text(
-                f"❌ Произошла ошибка при загрузке.\nПопробуйте позже или другую ссылку.\n\n"
-                f"<code>{str(e)[:200]}</code>", parse_mode="HTML"
+        err_str = str(e)
+        if "Request Entity Too Large" in err_str or "413" in err_str:
+            user_msg = (
+                "❌ <b>Файл слишком большой для Telegram.</b>\n\n"
+                "Telegram позволяет боту отправлять файлы не более <b>50 МБ</b>.\n\n"
+                "💡 Попробуйте скачать <b>аудио</b> — оно обычно намного меньше."
             )
+        else:
+            user_msg = (
+                f"❌ Произошла ошибка при загрузке.\n"
+                f"Попробуйте позже или другую ссылку.\n\n"
+                f"<code>{err_str[:200]}</code>"
+            )
+        try:
+            await status_msg.edit_text(user_msg, parse_mode="HTML")
         except Exception: pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
