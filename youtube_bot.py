@@ -25,7 +25,7 @@ REF_VIP_DAYS     = 7
 MAX_FILE_SIZE_MB = 100
 
 # Текст рекламы бота, который добавляется к подписи файла (только не-ВИП)
-BOT_AD_TEXT = "\n\n🤖 <b>Скачано через @FVyoutube_bot</b>\n📥 Скачивай видео, аудио и превью с YouTube бесплатно!"
+BOT_AD_TEXT = "\n\n🤖 <b>Скачано через @YourBotUsername</b>\n📥 Скачивай видео, аудио и превью с YouTube бесплатно!"
 
 # ═══════════════════════════════════════════════════════════════════
 
@@ -105,10 +105,11 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS channels (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id  TEXT,
-                title       TEXT,
-                link        TEXT
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id       TEXT,
+                title            TEXT,
+                link             TEXT,
+                auto_delete_days INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS broadcasts (
@@ -127,13 +128,28 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS ad_posts (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                type            TEXT    NOT NULL DEFAULT 'text',
-                file_id         TEXT    DEFAULT NULL,
-                caption         TEXT    DEFAULT '',
-                buttons         TEXT    DEFAULT NULL,
-                auto_delete_sec INTEGER DEFAULT 0,
-                created_at      TEXT    DEFAULT ''
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                type             TEXT    NOT NULL DEFAULT 'text',
+                file_id          TEXT    DEFAULT NULL,
+                caption          TEXT    DEFAULT '',
+                buttons          TEXT    DEFAULT NULL,
+                auto_delete_days INTEGER DEFAULT 0,
+                created_at       TEXT    DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS sent_ad_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id     INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                sent_at     TEXT    DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS downloads_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                dl_type     TEXT    DEFAULT '',
+                created_at  TEXT    DEFAULT ''
             );
         """)
 
@@ -151,9 +167,13 @@ def reg_user(uid, username, full_name, ref_by=None):
             (uid, username or "", full_name or "", datetime.now().strftime("%Y-%m-%d %H:%M"), ref_by)
         )
 
-def inc_downloads(uid):
+def inc_downloads(uid, dl_type: str = ""):
     with get_db() as c:
         c.execute("UPDATE users SET downloads=downloads+1 WHERE user_id=?", (uid,))
+        c.execute(
+            "INSERT INTO downloads_log (user_id, dl_type, created_at) VALUES (?,?,?)",
+            (uid, dl_type, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
 
 def inc_ref_count(uid):
     with get_db() as c:
@@ -235,10 +255,10 @@ def get_channels():
     with get_db() as c:
         return c.execute("SELECT * FROM channels").fetchall()
 
-def add_channel(channel_id, title, link):
+def add_channel(channel_id, title, link, auto_delete_days: int = 0):
     with get_db() as c:
-        c.execute("INSERT INTO channels (channel_id,title,link) VALUES (?,?,?)",
-                  (channel_id, title, link))
+        c.execute("INSERT INTO channels (channel_id,title,link,auto_delete_days) VALUES (?,?,?,?)",
+                  (channel_id, title, link, auto_delete_days))
 
 def del_channel(row_id):
     with get_db() as c:
@@ -257,6 +277,26 @@ async def check_subscriptions(uid: int):
     return missing
 
 
+async def require_subscription(msg_or_call, uid):
+    if is_vip(uid):
+        return True
+    missing = await check_subscriptions(uid)
+    if missing:
+        text = "📢 Для использования бота подпишитесь на наши каналы:"
+        if isinstance(msg_or_call, Message):
+            sent = await msg_or_call.answer(text, reply_markup=sub_kb(missing))
+        else:
+            sent = await msg_or_call.message.answer(text, reply_markup=sub_kb(missing))
+        # Автоудаление сообщения о подписке (берём минимальный таймер из каналов)
+        timers = [ch[4] for ch in missing if len(ch) > 4 and ch[4]]
+        if timers:
+            min_days = min(timers)
+            if min_days > 0:
+                asyncio.create_task(_auto_delete_later(uid, sent.message_id, min_days * 86400))
+        return False
+    return True
+
+
 # ── рекламные посты ───────────────────────────────────────────────
 
 def get_ad_posts():
@@ -267,19 +307,19 @@ def get_ad_post(post_id: int):
     with get_db() as c:
         return c.execute("SELECT * FROM ad_posts WHERE id=?", (post_id,)).fetchone()
 
-def add_ad_post(post_type: str, file_id, caption: str, buttons, auto_delete_sec: int):
+def add_ad_post(post_type: str, file_id, caption: str, buttons, auto_delete_days: int):
     with get_db() as c:
         c.execute(
-            "INSERT INTO ad_posts (type,file_id,caption,buttons,auto_delete_sec,created_at) VALUES (?,?,?,?,?,?)",
-            (post_type, file_id, caption, buttons, auto_delete_sec,
+            "INSERT INTO ad_posts (type,file_id,caption,buttons,auto_delete_days,created_at) VALUES (?,?,?,?,?,?)",
+            (post_type, file_id, caption, buttons, auto_delete_days,
              datetime.now().strftime("%Y-%m-%d %H:%M"))
         )
 
-def update_ad_post(post_id: int, post_type: str, file_id, caption: str, buttons, auto_delete_sec: int):
+def update_ad_post(post_id: int, post_type: str, file_id, caption: str, buttons, auto_delete_days: int):
     with get_db() as c:
         c.execute(
-            "UPDATE ad_posts SET type=?,file_id=?,caption=?,buttons=?,auto_delete_sec=? WHERE id=?",
-            (post_type, file_id, caption, buttons, auto_delete_sec, post_id)
+            "UPDATE ad_posts SET type=?,file_id=?,caption=?,buttons=?,auto_delete_days=? WHERE id=?",
+            (post_type, file_id, caption, buttons, auto_delete_days, post_id)
         )
 
 def delete_ad_post(post_id: int):
@@ -296,9 +336,9 @@ def get_random_ad_post():
 async def send_ad_post(uid: int, post: tuple):
     """
     Отправляет рекламный пост пользователю.
-    post: (id, type, file_id, caption, buttons, auto_delete_sec, created_at)
+    post: (id, type, file_id, caption, buttons, auto_delete_days, created_at)
     """
-    _, post_type, file_id, caption, buttons_raw, auto_delete_sec, _ = post
+    _, post_type, file_id, caption, buttons_raw, auto_delete_days, _ = post
     kb = parse_buttons(buttons_raw)
     try:
         if post_type == "photo" and file_id:
@@ -310,8 +350,15 @@ async def send_ad_post(uid: int, post: tuple):
         else:
             sent = await bot.send_message(uid, caption, reply_markup=kb, parse_mode="HTML")
 
-        if auto_delete_sec and auto_delete_sec > 0:
-            asyncio.create_task(_auto_delete_later(uid, sent.message_id, auto_delete_sec))
+        if auto_delete_days and auto_delete_days > 0:
+            asyncio.create_task(_auto_delete_later(uid, sent.message_id, auto_delete_days * 86400))
+        # Сохраняем id отправленного сообщения для возможности удалить из панели
+        post_id = post[0]
+        with get_db() as c:
+            c.execute(
+                "INSERT INTO sent_ad_messages (post_id,user_id,message_id,sent_at) VALUES (?,?,?,?)",
+                (post_id, uid, sent.message_id, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
         return sent
     except Exception as e:
         logger.warning(f"Ad post send error to {uid}: {e}")
@@ -370,6 +417,8 @@ class AdminState(StatesGroup):
     adpost_content      = State()
     adpost_buttons      = State()
     adpost_delete       = State()
+    # каналы с таймером
+    add_channel_timer   = State()
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -421,10 +470,10 @@ def admin_kb():
         [InlineKeyboardButton(text="👑 Выдать ВИП",        callback_data="adm_give_vip"),
          InlineKeyboardButton(text="❌ Отобрать ВИП",      callback_data="adm_revoke_vip")],
         [InlineKeyboardButton(text="📢 Рассылка",          callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="📣 Рекламные посты",   callback_data="adm_adposts")],
         [InlineKeyboardButton(text="📺 Обяз. подписки",    callback_data="adm_channels")],
         [InlineKeyboardButton(text="🚫 Бан/Разбан",        callback_data="adm_ban")],
         [InlineKeyboardButton(text="💰 Изменить цену ВИП", callback_data="adm_vip_price")],
-        [InlineKeyboardButton(text="📣 Рекламные посты",   callback_data="adm_adposts")],
     ])
 
 def adm_back_kb():
@@ -435,9 +484,9 @@ def adm_back_kb():
 def _adpost_list_kb(posts):
     rows = [[InlineKeyboardButton(text="➕ Добавить пост", callback_data="adp_add")]]
     for p in posts:
-        preview = (p[3] or "")[:28].replace("\n", " ")
-        del_ico = f"🗑{p[5]}с" if p[5] else "♾"
-        label   = f"#{p[0]} [{p[1]}] {preview}"
+        preview  = (p[3] or "")[:28].replace("\n", " ")
+        del_ico  = f"🗑{p[5]}д" if p[5] else "♾"
+        label    = f"#{p[0]} [{p[1]}] {preview}"
         rows.append([
             InlineKeyboardButton(text=f"✏️ {label}", callback_data=f"adp_edit_{p[0]}"),
             InlineKeyboardButton(text=del_ico,         callback_data=f"adp_del_{p[0]}"),
@@ -659,20 +708,6 @@ async def cmd_start(msg: Message, state: FSMContext):
     )
 
 
-async def require_subscription(msg_or_call, uid):
-    if is_vip(uid):
-        return True
-    missing = await check_subscriptions(uid)
-    if missing:
-        text = "📢 Для использования бота подпишитесь на наши каналы:"
-        if isinstance(msg_or_call, Message):
-            await msg_or_call.answer(text, reply_markup=sub_kb(missing))
-        else:
-            await msg_or_call.message.answer(text, reply_markup=sub_kb(missing))
-        return False
-    return True
-
-
 @router.callback_query(F.data == "check_sub")
 async def check_sub_cb(call: CallbackQuery):
     missing = await check_subscriptions(call.from_user.id)
@@ -822,7 +857,7 @@ async def download_execute(call: CallbackQuery, state: FSMContext):
                                  caption=f"🎬 <b>{title}</b>{ad_suffix}", parse_mode="HTML")
             await _safe_delete(status_msg)
 
-        inc_downloads(uid)
+        inc_downloads(uid, dl_type)
         await _post_download_ads(uid)
 
     except Exception as e:
@@ -953,9 +988,18 @@ async def ref_program(call: CallbackQuery):
 async def claim_ref_vip(call: CallbackQuery):
     uid  = call.from_user.id
     user = get_user(uid)
-    if not user:                          return await call.answer("Ошибка", show_alert=True)
-    if user[6]:                           return await call.answer("❌ Вы уже использовали эту акцию!", show_alert=True)
-    if user[5] < REF_INVITE_COUNT:        return await call.answer(f"❌ Нужно ещё {REF_INVITE_COUNT - user[5]} рефералов!", show_alert=True)
+    if not user:               return await call.answer("Ошибка", show_alert=True)
+    if user[6]:                return await call.answer("❌ Вы уже использовали эту акцию!", show_alert=True)
+    if user[5] < REF_INVITE_COUNT:
+        return await call.answer(f"❌ Нужно ещё {REF_INVITE_COUNT - user[5]} рефералов!", show_alert=True)
+    if is_vip(uid):
+        expires = vip_expires_str(uid)
+        return await call.answer(
+            f"✅ У вас уже активен ВИП!\n"
+            f"Действует: {expires}\n\n"
+            f"Приз можно получить только когда ВИП не активен.",
+            show_alert=True
+        )
 
     set_ref_used(uid)
     expires = give_vip(uid, REF_VIP_DAYS)
@@ -1009,21 +1053,32 @@ async def adm_back(call: CallbackQuery, state: FSMContext):
 async def adm_stats(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS: return
     with get_db() as c:
-        total   = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        banned  = c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-        vip_cnt = c.execute("SELECT COUNT(*) FROM vip WHERE expires_at > ?", (datetime.now().strftime("%Y-%m-%d %H:%M"),)).fetchone()[0]
-        dls     = c.execute("SELECT SUM(downloads) FROM users").fetchone()[0] or 0
-        stars   = c.execute("SELECT SUM(stars) FROM stars_payments").fetchone()[0] or 0
-        today   = datetime.now().strftime("%Y-%m-%d")
-        new     = c.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)).fetchone()[0]
-        chans   = c.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
-        ad_cnt  = c.execute("SELECT COUNT(*) FROM ad_posts").fetchone()[0]
+        total    = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        banned   = c.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
+        vip_cnt  = c.execute("SELECT COUNT(*) FROM vip WHERE expires_at > ?", (datetime.now().strftime("%Y-%m-%d %H:%M"),)).fetchone()[0]
+        # Скачивания всех пользователей из лога
+        dls_all  = c.execute("SELECT COUNT(*) FROM downloads_log").fetchone()[0] or 0
+        dls_vid  = c.execute("SELECT COUNT(*) FROM downloads_log WHERE dl_type='dl_video'").fetchone()[0] or 0
+        dls_aud  = c.execute("SELECT COUNT(*) FROM downloads_log WHERE dl_type='dl_audio'").fetchone()[0] or 0
+        dls_thm  = c.execute("SELECT COUNT(*) FROM downloads_log WHERE dl_type='dl_thumb'").fetchone()[0] or 0
+        # Старые записи без лога (в users.downloads)
+        dls_users = c.execute("SELECT SUM(downloads) FROM users").fetchone()[0] or 0
+        stars    = c.execute("SELECT SUM(stars) FROM stars_payments").fetchone()[0] or 0
+        today    = datetime.now().strftime("%Y-%m-%d")
+        new      = c.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)).fetchone()[0]
+        dls_today = c.execute("SELECT COUNT(*) FROM downloads_log WHERE created_at LIKE ?", (f"{today}%",)).fetchone()[0] or 0
+        chans    = c.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+        ad_cnt   = c.execute("SELECT COUNT(*) FROM ad_posts").fetchone()[0]
+        uniq_dls = c.execute("SELECT COUNT(DISTINCT user_id) FROM downloads_log").fetchone()[0] or 0
     await call.message.edit_text(
         f"📊 <b>Статистика</b>\n\n"
         f"👥 Всего: {total}  |  Сегодня: +{new}\n"
         f"🚫 Заблокировано: {banned}\n"
-        f"👑 ВИП активных: {vip_cnt}\n"
-        f"📥 Скачиваний: {dls}\n"
+        f"👑 ВИП активных: {vip_cnt}\n\n"
+        f"📥 <b>Скачивания (все пользователи):</b>\n"
+        f"  Всего: {dls_users} | Сегодня: {dls_today}\n"
+        f"  🎬 Видео: {dls_vid}  🎵 Аудио: {dls_aud}  🖼 Превью: {dls_thm}\n"
+        f"  👤 Уникальных юзеров качали: {uniq_dls}\n\n"
         f"⭐ Заработано звёзд: {stars}\n"
         f"📺 Обяз. каналов: {chans}\n"
         f"📣 Рекламных постов: {ad_cnt}",
@@ -1203,7 +1258,14 @@ async def adm_channels(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS: return
     chs  = get_channels()
     text = "📺 <b>Обязательные подписки</b>\n\n"
-    text += "\n".join(f"• {ch[2]}  ({ch[1]})" for ch in chs) if chs else "Каналы не добавлены."
+    if chs:
+        lines = []
+        for ch in chs:
+            timer_str = f" 🗑{ch[4]}д" if len(ch) > 4 and ch[4] else " ♾"
+            lines.append(f"• {ch[2]}  ({ch[1]}){timer_str}")
+        text += "\n".join(lines)
+    else:
+        text += "Каналы не добавлены."
     rows = [[InlineKeyboardButton(text="➕ Добавить", callback_data="ch_add")]]
     for ch in chs:
         rows.append([InlineKeyboardButton(text=f"🗑 {ch[2]}", callback_data=f"ch_del_{ch[0]}")])
@@ -1215,17 +1277,61 @@ async def adm_channels(call: CallbackQuery):
 async def ch_add_prompt(call: CallbackQuery, state: FSMContext):
     if call.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminState.add_channel)
-    await call.message.answer("➕ Введите:\n<code>@channel_id|Название|https://t.me/channel</code>", parse_mode="HTML")
+    await call.message.answer(
+        "➕ <b>Добавить канал — шаг 1/2</b>\n\n"
+        "Введите данные канала:\n"
+        "<code>@channel_id|Название|https://t.me/channel</code>\n\n"
+        "⚠️ Бот должен быть администратором в канале!",
+        parse_mode="HTML"
+    )
 
 
 @router.message(AdminState.add_channel)
 async def ch_add_handler(msg: Message, state: FSMContext):
     if msg.from_user.id not in ADMIN_IDS: return
     parts = msg.text.split("|")
-    if len(parts) != 3: return await msg.answer("❌ Формат: @channel|Название|https://ссылка")
-    add_channel(parts[0].strip(), parts[1].strip(), parts[2].strip())
+    if len(parts) != 3:
+        return await msg.answer("❌ Формат: @channel|Название|https://ссылка")
+    await state.update_data(
+        ch_id=parts[0].strip(),
+        ch_title=parts[1].strip(),
+        ch_link=parts[2].strip()
+    )
+    await state.set_state(AdminState.add_channel_timer)
+    await msg.answer(
+        "➕ <b>Добавить канал — шаг 2/2</b>\n\n"
+        "Через сколько <b>дней</b> автоматически удалять сообщение\n"
+        "«подпишитесь на каналы» у пользователя?\n\n"
+        "• <code>0</code> — не удалять\n"
+        "• <code>1</code> — через 1 день\n"
+        "• <code>3</code> — через 3 дня\n"
+        "• <code>7</code> — через 7 дней",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="0"), KeyboardButton(text="1"),
+                       KeyboardButton(text="3"), KeyboardButton(text="7")]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminState.add_channel_timer)
+async def ch_add_timer_handler(msg: Message, state: FSMContext):
+    if msg.from_user.id not in ADMIN_IDS: return
+    try:
+        days = int(msg.text.strip())
+        if days < 0: raise ValueError
+    except ValueError:
+        return await msg.answer("❌ Введите 0 или количество дней (целое ≥ 0).")
+    data = await state.get_data()
+    add_channel(data["ch_id"], data["ch_title"], data["ch_link"], days)
     await state.clear()
-    await msg.answer("✅ Канал добавлен!", reply_markup=main_kb(msg.from_user.id))
+    timer_text = f"🗑 Автоудаление через {days} дн." if days > 0 else "♾ Без автоудаления"
+    await msg.answer(
+        f"✅ Канал <b>{data['ch_title']}</b> добавлен!\n{timer_text}",
+        reply_markup=main_kb(msg.from_user.id),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("ch_del_"))
@@ -1275,7 +1381,7 @@ async def adm_adposts(call: CallbackQuery, state: FSMContext):
         f"📣 <b>Рекламные посты</b>\n\n"
         f"Всего: <b>{len(posts)}</b> шт.\n"
         f"После каждой скачки случайный пост отправляется не-ВИП пользователям.\n\n"
-        f"🗑<i>N</i>с — автоудаление через N секунд\n"
+        f"🗑<i>N</i>д — автоудаление через N дней\n"
         f"♾ — не удаляется"
     )
     await call.message.edit_text(text, reply_markup=_adpost_list_kb(posts), parse_mode="HTML")
@@ -1308,7 +1414,7 @@ async def adp_edit_start(call: CallbackQuery, state: FSMContext):
         await call.answer("❌ Пост не найден!", show_alert=True); return
 
     _, post_type, file_id, caption, buttons, auto_del, _ = post
-    del_text  = f"{auto_del} сек." if auto_del else "нет"
+    del_text  = f"{auto_del} дн." if auto_del else "нет"
     btns_text = buttons if buttons else "нет"
 
     await call.message.answer(
@@ -1370,13 +1476,15 @@ async def adp_got_buttons(msg: Message, state: FSMContext):
     await state.set_state(AdminState.adpost_delete)
     await msg.answer(
         "📣 <b>Шаг 3/3 — Автоудаление</b>\n\n"
-        "Через сколько секунд удалять пост у пользователя?\n\n"
+        "Через сколько <b>дней</b> удалять пост у пользователя?\n\n"
         "• <code>0</code> — не удалять\n"
-        "• <code>60</code> — через 1 минуту\n"
-        "• <code>300</code> — через 5 минут\n"
-        "• <code>3600</code> — через 1 час",
+        "• <code>1</code> — через 1 день\n"
+        "• <code>3</code> — через 3 дня\n"
+        "• <code>7</code> — через 7 дней\n"
+        "• <code>30</code> — через 30 дней",
         reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="0"), KeyboardButton(text="60"), KeyboardButton(text="300")],
+            keyboard=[[KeyboardButton(text="0"), KeyboardButton(text="1"),
+                       KeyboardButton(text="3"), KeyboardButton(text="7")],
                       [KeyboardButton(text="❌ Отмена")]],
             resize_keyboard=True
         ),
@@ -1396,7 +1504,7 @@ async def adp_got_delete(msg: Message, state: FSMContext):
         auto_del = int(msg.text.strip())
         if auto_del < 0: raise ValueError
     except ValueError:
-        return await msg.answer("❌ Введите 0 или количество секунд (целое ≥ 0).")
+        return await msg.answer("❌ Введите 0 или количество дней (целое ≥ 0).")
 
     data      = await state.get_data()
     mode      = data.get("adp_mode", "add")
@@ -1414,7 +1522,7 @@ async def adp_got_delete(msg: Message, state: FSMContext):
         add_ad_post(post_type, file_id, caption, buttons, auto_del)
         action_text = "✅ Рекламный пост добавлен!"
 
-    del_text = f"🗑 Автоудаление: через {auto_del} сек." if auto_del > 0 else "🗑 Автоудаление: отключено"
+    del_text = f"🗑 Автоудаление: через {auto_del} дн." if auto_del > 0 else "🗑 Автоудаление: отключено"
     await msg.answer(
         f"{action_text}\n\n"
         f"📝 Тип: {post_type}\n"
@@ -1429,10 +1537,67 @@ async def adp_got_delete(msg: Message, state: FSMContext):
 async def adp_delete(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS: return
     post_id = int(call.data.split("_")[2])
+    # Спрашиваем — удалить только из базы или ещё и у всех пользователей
+    with get_db() as c:
+        sent_cnt = c.execute("SELECT COUNT(*) FROM sent_ad_messages WHERE post_id=?", (post_id,)).fetchone()[0]
+    await call.message.answer(
+        f"🗑 <b>Удалить рекламный пост #{post_id}?</b>\n\n"
+        f"Этот пост был отправлен <b>{sent_cnt}</b> пользователям.\n\n"
+        f"Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить из базы", callback_data=f"adp_deldb_{post_id}")],
+            [InlineKeyboardButton(text="🗑💬 Удалить + отозвать у юзеров", callback_data=f"adp_delall_{post_id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm_adposts")],
+        ]),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adp_deldb_"))
+async def adp_deldb(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: return
+    post_id = int(call.data.split("_")[2])
+    with get_db() as c:
+        c.execute("DELETE FROM sent_ad_messages WHERE post_id=?", (post_id,))
     delete_ad_post(post_id)
-    await call.answer(f"✅ Пост #{post_id} удалён!")
+    await call.answer(f"✅ Пост #{post_id} удалён из базы!")
     posts = get_ad_posts()
-    text = f"📣 <b>Рекламные посты</b>\n\nВсего: <b>{len(posts)}</b> шт."
+    text  = f"📣 <b>Рекламные посты</b>\n\nВсего: <b>{len(posts)}</b> шт."
+    try:
+        await call.message.edit_text(text, reply_markup=_adpost_list_kb(posts), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("adp_delall_"))
+async def adp_delall(call: CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS: return
+    post_id = int(call.data.split("_")[2])
+    # Собираем все отправленные сообщения
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT user_id, message_id FROM sent_ad_messages WHERE post_id=?", (post_id,)
+        ).fetchall()
+    await call.answer("⏳ Удаляю у пользователей...")
+    ok, fail = 0, 0
+    for user_id, message_id in rows:
+        try:
+            await bot.delete_message(user_id, message_id)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.03)
+    # Удаляем из БД
+    with get_db() as c:
+        c.execute("DELETE FROM sent_ad_messages WHERE post_id=?", (post_id,))
+    delete_ad_post(post_id)
+    posts = get_ad_posts()
+    text  = (
+        f"✅ Пост #{post_id} удалён!\n"
+        f"💬 Удалено у пользователей: {ok}  ❌ Ошибок: {fail}\n\n"
+        f"📣 <b>Рекламные посты</b>\n\nВсего: <b>{len(posts)}</b> шт."
+    )
     try:
         await call.message.edit_text(text, reply_markup=_adpost_list_kb(posts), parse_mode="HTML")
     except Exception:
