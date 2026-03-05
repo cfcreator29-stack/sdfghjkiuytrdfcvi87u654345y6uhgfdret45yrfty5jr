@@ -22,7 +22,7 @@ VIP_DAYS         = 30
 REF_INVITE_COUNT = 3
 REF_VIP_DAYS     = 7
 
-MAX_FILE_SIZE_MB = 200
+MAX_FILE_SIZE_MB = 250
 
 # Текст рекламы бота, который добавляется к подписи файла (только не-ВИП)
 BOT_AD_TEXT = "\n\n🤖 <b>Скачано через @FVyoutube_bot</b>\n📥 Скачивай видео, аудио и превью с YouTube бесплатно!"
@@ -662,9 +662,13 @@ async def get_video_info(url: str) -> dict | None:
 # ║                      📨  ХЕНДЛЕРЫ                              ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
+@router.message(Command("admin"))
+async def cmd_admin(msg: Message, state: FSMContext):
+    await admin_panel(msg, state)
+
+
 @router.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext):
-    await state.clear()
+async def cmd_start(msg: Message, state: FSMContext):    await state.clear()
     u = msg.from_user
     args = msg.text.split()
     ref_id = None
@@ -1645,6 +1649,14 @@ async def vip_cleanup_loop():
 async def main():
     init_db()
     logger.info("✅ Бот запущен!")
+
+    # Устанавливаем команды бота (меню кнопки)
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start",  description="🎬 YouTube Downloader"),
+        BotCommand(command="admin",  description="👑 Панель администратора"),
+    ])
+
     asyncio.create_task(vip_cleanup_loop())
     await dp.start_polling(bot, skip_updates=True)
 
